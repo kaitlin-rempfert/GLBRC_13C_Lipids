@@ -1,0 +1,220 @@
+---
+title: "xcms to pmartR"
+author: "Kaitlin Rempfert"
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+output:
+  html_document: 
+    df_print: paged 
+    number_sections: yes 
+    css: stylesheet.css 
+    toc: yes 
+    toc_float: true 
+    toc_depth: 3 
+    code_folding: show 
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, echo = FALSE, message=FALSE, warning=FALSE}
+# load required packages
+library(tidyverse)
+library(ggplot2)
+library(pmartR)
+library(qcrlsc)
+library(MSnbase)
+library(xcms)
+library(sqldf)
+
+source("scripts/XIC.R")
+```
+
+
+# Positive Mode
+
+## Import positive mode filled peaks 
+```{r}
+dda_data_pos_fill <- readRDS("output/xcms/dda_data_pos_batch3_fill.rds")
+```
+
+## Extract positive mode peaks 
+```{r}
+#extract feature definitions and values from xcms object
+pos_featureDefinitions <- as.data.frame(featureDefinitions(dda_data_pos_fill)) %>% rownames_to_column("Feature")
+pos_featureValues <- as.data.frame(featureValues(dda_data_pos_fill, value = "maxo")) %>% rownames_to_column("Feature")
+#join
+pos_features <- left_join(pos_featureDefinitions, pos_featureValues)
+#reformat data
+data_pos <- pos_features %>% mutate(
+  rt_min = as.numeric(rtmed)/60,
+  group_id = Feature,
+  mz = mzmed
+)
+```
+
+
+## Look at intensity of QC peaks- constant throughout run?
+```{r}
+#QC on picked peaks- is intensity normalized?
+pos_features_qc <- pos_featureValues %>% select(contains("EC_QC")) %>% mutate_if(is.numeric , replace_na, replace = 1)
+boxplot(pos_features_qc, log="y", las=2, col = "cornflowerblue", ylab = "intensity", main = "QC Peak Intensities")
+```
+
+
+## Match mz and RT of features to LIQUID output
+```{r}
+#select just relevent columns 
+data_pos <- data_pos %>% select(c(group_id, mz, rt_min, contains("EC")))
+
+#import database
+db <- read.csv("output/LIQUID/pos_LIQUID_db.csv") %>% select(-X)
+
+#match to database
+id <- sqldf("select * from data_pos data1 left join db db1 on db1.mz_db = (select db2.mz_db from data_pos data2 left join db db2 where data2.group_id = data1.group_id and abs(data2.mz - db2.mz_db) < .008 order by abs(data2.mz - db2.mz_db) asc limit 1)")
+#filter to closest matches
+#pos_annotated <- id %>% filter(!is.na(Compound)) %>% mutate(rt_diff = abs(rt_db - rt_min)) %>% group_by(Compound) %>% slice_min(rt_diff) %>% ungroup() %>% filter(rt_diff < .1) %>% select(-group_id)
+pos_annotated <- id %>% filter(!is.na(Compound)) %>% mutate(rt_diff = abs(rt_db - rt_min)) %>% filter(rt_diff < 1) %>% rowwise() %>%
+# mutate column for average of QC to select best "peak" and slice at max intensity
+mutate(
+  #QC_avg = mean(c_across(contains("QC"))), 
+  tally = sum(!is.na(c_across((starts_with("EC")))))
+       ) %>% group_by(Compound) %>% slice_max(tally) %>% slice_min(rt_diff) %>% ungroup() %>% select(-group_id)
+```
+
+
+## Create Inputs for pmartR
+```{r}
+#create lipid edata 
+lipid_edata_pos <- pos_annotated %>% select(Compound, starts_with("EC")) 
+
+#create lipid fdata 
+#export sample names for fdata
+fdata_pos <- pos_annotated %>% select(c(starts_with("EC"))) %>% t() %>% as.data.frame() %>% rownames_to_column("sample_name") %>% select(sample_name)
+#read in metadata
+meta <- readxl::read_xlsx("data/incubation_metadata_w_qc_BTLE_set2.xlsx")
+#create lipid fdata (crop, timepoint, site, group)
+lipid_fdata_pos <- left_join(fdata_pos, meta) %>% select(c(sample_name, group, batch, injection_order, site, crop, timepoint)) 
+
+#create lipid emeta
+lipid_emeta_pos <- pos_annotated %>% select(Compound, Category, Adduct, Formula, mz_db, rt_db)
+```
+
+## Create lipidomic data object in pmartR
+```{r}
+mylipidData_pos <- pmartR::as.lipidData(e_data = lipid_edata_pos, f_data = lipid_fdata_pos, e_meta = lipid_emeta_pos, edata_cname = "Compound", emeta_cname = "Compound", fdata_cname = "sample_name", data_scale = "abundance")
+class(mylipidData_pos)
+
+saveRDS(mylipidData_pos, "output/pmartR/mylipidData_pos_batch3.rds")
+
+plot(mylipidData_pos)
+```
+
+
+
+# Negative Mode
+
+## Import positive mode filled peaks 
+```{r}
+dda_data_neg_fill <- readRDS("output/xcms/dda_data_neg_batch4_fill.rds")
+```
+
+## Extract positive mode peaks 
+```{r}
+#extract feature definitions and values from xcms object
+neg_featureDefinitions <- as.data.frame(featureDefinitions(dda_data_neg_fill)) %>% rownames_to_column("Feature")
+neg_featureValues <- as.data.frame(featureValues(dda_data_neg_fill, value = "maxo")) %>% rownames_to_column("Feature")
+#join
+neg_features <- left_join(neg_featureDefinitions, neg_featureValues)
+#reformat data
+data_neg <- neg_features %>% mutate(
+  rt_min = as.numeric(rtmed)/60,
+  group_id = Feature,
+  mz = mzmed
+)
+```
+
+
+## Look at intensity of QC peaks- constant throughout run?
+```{r}
+#QC on picked peaks- is intensity normalized?
+neg_features_qc <- neg_featureValues %>% select(contains("EC_QC")) %>% mutate_if(is.numeric , replace_na, replace = 1)
+boxplot(neg_features_qc, log="y", las=2, col = "cornflowerblue", ylab = "intensity", main = "QC Peak Intensities")
+```
+
+
+## Match mz and RT of features to LIQUID output
+```{r}
+#select just relevent columns 
+data_neg <- data_neg %>% select(c(group_id, mz, rt_min, contains("EC")))
+
+#import database
+db <- read.csv("data/databases/neg_LIQUID_db.csv") %>% select(-X)
+
+#match to database
+id <- sqldf("select * from data_neg data1 left join db db1 on db1.mz_db = (select db2.mz_db from data_neg data2 left join db db2 where data2.group_id = data1.group_id and abs(data2.mz - db2.mz_db) < .008 order by abs(data2.mz - db2.mz_db) asc)")
+
+# removed "limit 1" after asc
+#filter to closest matches
+neg_annotated <- id %>% filter(!is.na(Compound)) %>% mutate(rt_diff = abs(rt_db - rt_min)) %>% filter(rt_diff < 1) %>% rowwise() %>%
+# mutate column for average of QC to select best "peak" and slice at max intensity
+mutate(
+  #QC_avg = mean(c_across(contains("QC"))), 
+  tally = sum(!is.na(c_across((starts_with("EC")))))
+       ) %>% group_by(Compound) %>% slice_max(tally) %>% slice_min(rt_diff) %>% ungroup() %>% select(-c(group_id, tally))
+```
+
+
+## Manually extract fatty acid peaks (shift in RT between samples)
+```{r}
+#import FA database
+FA <- readxl::read_xlsx("data/databases/fatty_acids.xlsx") %>% mutate(rt_window = 80, Adduct = "[M-H]-")
+
+#extract peaks corresponding to fatty acids 
+peak_area <- extract_peak_apex_h(FA, dda_data_neg_fill)
+
+#reformat peak area data (filtered out QC here)
+peak_area_reformatted <- peak_area %>% ungroup() %>% group_by(Compound) %>% mutate(
+  mz = as.numeric(as.character(mz)), 
+  rt_min = as.numeric(as.character(rt_min)),
+  area = as.numeric(as.character(area)),
+  rt_min = mean(rt_min, na.rm = TRUE), 
+  mz = mean(mz, na.rm = TRUE)) %>% ungroup() %>% pivot_wider(names_from = sample_name, values_from = area)
+
+#join with peak area metadata and rename columns for joining with other annotated data
+FA_peakareas <- left_join(peak_area_reformatted, FA, by = c("Compound" = "compound")) %>% select(-rt_window) %>% mutate(
+  Category = "Fatty Acyls [FA]", 
+  Adduct = "[M-H]-",
+  rt_diff = abs(mz_db - mz)
+)
+
+#join with other annotated data
+neg_annotated <- rbind(neg_annotated, FA_peakareas)
+```
+
+
+## Create Inputs for pmartR
+```{r}
+#create lipid edata 
+lipid_edata_neg <- neg_annotated %>% select(Compound, starts_with("EC")) 
+
+#create lipid fdata 
+#export sample names for fdata
+fdata_neg <- lipid_edata_neg %>% select(starts_with("EC")) %>% t() %>% as.data.frame() %>% rownames_to_column("sample_name") %>% select(sample_name)
+#read in metadata
+meta <- readxl::read_xlsx("data/incubation_metadata_w_qc_BTLE_set2.xlsx")
+#create lipid fdata (crop, timepoint, site, group)
+lipid_fdata_neg <- left_join(fdata_neg, meta) %>% select(c(sample_name, group, batch, injection_order, site, crop, timepoint)) 
+
+#create lipid emeta
+lipid_emeta_neg <- neg_annotated %>% select(Compound, Category, Adduct, Formula, mz_db, rt_db)
+```
+
+## Create lipidomic data object in pmartR
+```{r}
+mylipidData_neg <- pmartR::as.lipidData(e_data = lipid_edata_neg, f_data = lipid_fdata_neg, e_meta = lipid_emeta_neg, edata_cname = "Compound", emeta_cname = "Compound", fdata_cname = "sample_name", data_scale = "abundance")
+class(mylipidData_neg)
+
+saveRDS(mylipidData_neg, "output/pmartR/mylipidData_neg_batch4.rds")
+
+plot(mylipidData_neg)
+```
+

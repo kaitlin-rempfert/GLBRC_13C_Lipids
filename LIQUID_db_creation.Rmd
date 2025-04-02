@@ -1,0 +1,156 @@
+---
+title: "LIQUID database creation"
+output: html_document
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+output:
+  html_document: 
+    df_print: paged 
+    number_sections: yes 
+    css: stylesheet.css 
+    toc: yes 
+    toc_float: true 
+    toc_depth: 3 
+    code_folding: show 
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, echo = FALSE, message=FALSE, warning=FALSE}
+# load required packages
+library(tidyverse)
+library(ggplot2)
+library(stringi)
+library(xcms)
+library(IsoCorrectoR)
+library(rstatix)
+library(ggpubr)
+
+#import scripts here
+source(file.path("scripts", "XIC.R"))
+```
+
+
+# Positive Mode
+
+## Import positive mode LIQUID output 
+```{r}
+#import LIQUID output 
+  #path to file for batch 3 data
+  LIQUID_batch3 <- "data/LIQUID/Set02_EC5_LIQUID_output_POS.xlsx"
+  #get names of tabs to import
+  tab_names <- readxl::excel_sheets(path = LIQUID_batch3)
+  #filter out "Set2" sample that was already run in batch 2
+  tab_names_pos <- tab_names %>% .[!grepl("Set2", .)]
+  #read data for all tabs
+  list_all <- lapply(tab_names_pos, function(x) readxl::read_excel(path = LIQUID_batch3, sheet = x))
+  #add sheetnames
+  names(list_all) <- tab_names_pos
+  #make dataframe
+  LIQUID_batch3 <- plyr::ldply(list_all, data.frame)
+```
+
+## Average retention times across samples for each compound
+```{r}
+#average retention times for each compound name 
+LIQUID_batch3_RT <- LIQUID_batch3 %>% select(c(Common.Name, Exact.m.z, Formula, Category, Apex.RT, Intensity, Adduct)) %>% mutate(Exact.m.z = round(as.numeric(Exact.m.z), 3)) %>% group_by(Common.Name, Exact.m.z, Formula, Category, Adduct) %>% summarise(Average.Apex.RT = mean(Apex.RT), Average.Intensity = mean(Intensity))
+```
+
+## Remove duplicates of compounds that are isomers within 0.1 minutes RT
+```{r}
+#remove duplicates of compounds that are isomers within 30 seconds RT (choose highest intensity isomer); these isomers will be extracted within same EIC window
+LIQUID_batch3_RT_dupflag <- LIQUID_batch3_RT %>% ungroup() %>% group_by(Formula) %>% mutate(count = n(), RT_span = ifelse(count > 1, max(Average.Apex.RT)- min(Average.Apex.RT), NA)) 
+
+#remove isomers that are already labeled as _A, _B, _C in another sample or that have a more specific ID at same RT (within .1 minutes)
+to_remove <- c("PC(0:0/18:1)", "Cer(d20:0/18:0)", "DG(16:0/17:0/0:0)", "DG(18:0/20:0/0:0)", "TG(12:0/16:1/16:1)", "TG(14:0/14:1/16:1);TG(12:0/16:1/16:1)", "PC(18:1/18:1)", "TG(14:0/16:1/16:1)", "TG(46:0)", "PC(18:1/19:1)", "TG(15:1/16:1/16:1)", "PC(18:1/20:5)", "TG(15:0/16:1/16:1)", "TG(15:0/16:0/16:0);TG(15:0/15:0/17:0)", "TG(16:0/16:1/16:1)", "TG(16:0/16:0/16:1)", "TG(16:0/16:0/17:0);TG(15:0/17:0/17:0)", "TG(49:0)", "TG(50:6)", "TG(16:0/16:1/18:2)", "TG(16:1/16:1/18:1);TG(16:0/16:1/18:2)", "TG(16:0/16:0/18:2)", "TG(16:0/16:1/18:1)", "TG(16:0/16:1/18:1);TG(16:0/16:0/18:2)", "TG(51:2)", "TG(16:1/16:1/20:5)", "TG(52:6)", "TG(52:5)", "TG(16:1/18:1/18:2)", "TG(16:0/18:2/18:2)", "TG(16:0/18:1/18:2)", "TG(16:1/18:1/18:1)", "TG(17:0/18:2/18:3)", "TG(53:5)", "TG(17:1/18:1/18:2)", "TG(18:1/18:2/18:3)", "TG(53:2)", "TG(18:2/18:2/18:2)", "TG(18:1/18:2/18:2)","TG(18:1/18:1/18:2)", "TG(15:1/20:4/20:4);TG(15:0/20:4/20:5)", "TG(18:0/18:0/18:2)", "TG(18:0/18:1/18:1)", "TG(18:0/18:0/18:1)", "TG(18:0/18:0/18:1);TG(16:0/18:1/20:0)", "TG(18:1/18:1/20:5)", "TG(56:7)", "TG(18:2/18:2/20:0);TG(18:1/18:3/20:0)", "TG(18:1/18:2/20:1)", "TG(56:2)", "TG(18:0/18:0/20:0)", "TG(18:2/20:4/20:5)", "TG(18:2/20:4/20:4)", "TG(18:1/20:1/20:3)", "TG(18:2/18:2/22:1)", "TG(18:2/20:1/20:1)", "TG(58:2)", "TG(60:13)", "TG(18:2/18:2/24:0)", "TG(60:3)")
+LIQUID_batch3_RT_dupremov <- LIQUID_batch3_RT_dupflag %>% filter(!Common.Name %in% to_remove)
+
+#rename to combine isomers within .1 minutes 
+LIQUID_batch3_RT_dupremov <- LIQUID_batch3_RT_dupremov %>% mutate(
+  Common.Name = case_when(
+grepl("PC(18:2/20:4)", Common.Name, fixed = TRUE) ~ "PC(18:2/20:4);PC(18:1/20:5)",
+grepl("TG(16:0/18:1/18:3);TG(16:0/18:2/18:2)", Common.Name, fixed = TRUE) ~ "TG(16:0/18:1/18:3);TG(16:0/18:2/18:2);TG(16:1/18:1/18:2)",
+grepl("TG(17:2/18:1/18:2);TG(17:1/18:2/18:2)", Common.Name, fixed = TRUE) ~ "TG(17:2/18:1/18:2);TG(17:1/18:2/18:2);TG(17:0/18:2/18:3)",
+grepl("TG(17:0/18:2/18:2)", Common.Name, fixed = TRUE) ~ "TG(17:0/18:2/18:2);TG(17:1/18:1/18:2)", 
+grepl("TG(18:0/18:2/18:2)", Common.Name, fixed = TRUE) ~ "TG(18:0/18:2/18:2);TG(18:1/18:1/18:2)", 
+grepl("TG(18:0/18:1/18:1);TG(16:0/18:1/20:1)", Common.Name, fixed = TRUE) ~ "TG(18:0/18:1/18:1);TG(16:0/18:1/20:1);TG(18:0/18:0/18:2)", 
+grepl("TG(18:1/18:1/20:2);TG(18:1/18:2/20:1)", Common.Name, fixed = TRUE) ~ "TG(18:1/18:1/20:2);TG(18:1/18:2/20:1);TG(18:2/18:2/20:0);TG(18:1/18:3/20:0)",
+grepl("TG(18:1/20:5/20:5)", Common.Name, fixed = TRUE) ~ "TG(18:1/20:5/20:5);TG(18:2/20:4/20:5)", 
+grepl("TG(18:1/20:4/20:5)", Common.Name, fixed = TRUE) ~ "TG(18:1/20:4/20:5);TG(18:2/20:4/20:4)",
+grepl("TG(18:1/18:3/22:1)", Common.Name, fixed = TRUE) ~ "TG(18:1/18:3/22:1);TG(18:1/20:1/20:3);TG(18:2/18:2/22:1)",
+grepl("TG(18:2/18:2/22:0)", Common.Name, fixed = TRUE) ~ "TG(18:2/18:2/22:0);TG(18:2/20:1/20:1)",
+grepl("TG(18:1/18:2/24:1)", Common.Name, fixed = TRUE) ~ "TG(18:1/18:2/24:1);TG(18:2/18:2/24:0)",
+TRUE ~ Common.Name)
+)
+
+#select relevant columns
+pos_LIQUID_db <- LIQUID_batch3_RT_dupremov %>% select(c(Common.Name, Category, Formula, Adduct, Exact.m.z, Average.Apex.RT)) %>% dplyr::rename("rt_db" = "Average.Apex.RT", "Compound" = "Common.Name", "mz_db" = "Exact.m.z")
+
+#export
+write.csv(pos_LIQUID_db, "output/LIQUID/pos_LIQUID_db.csv")
+```
+
+
+
+
+# Negative Mode
+
+## Import positive mode LIQUID output 
+```{r}
+#import LIQUID output 
+  #path to file for batch 3 data
+  LIQUID_batch4 <- "output/LIQUID/Set02_EC5_LIQUID_output_NEG.xlsx"
+  #get names of tabs to import
+  tab_names <- readxl::excel_sheets(path = LIQUID_batch4)
+  #filter out "Set2" sample that was already run in batch 2
+  tab_names_pos <- tab_names %>% .[!grepl("Set2", .)]
+  #read data for all tabs
+  list_all <- lapply(tab_names_pos, function(x) readxl::read_excel(path = LIQUID_batch4, sheet = x))
+  #add sheetnames
+  names(list_all) <- tab_names_pos
+  #make dataframe
+  LIQUID_batch4 <- plyr::ldply(list_all, data.frame)
+```
+
+## Average retention times across samples for each compound
+```{r}
+#average retention times for each compound name 
+LIQUID_batch4_RT <- LIQUID_batch4 %>% select(c(Common.Name, Exact.m.z, Formula, Category, Apex.RT, Intensity, Adduct)) %>% mutate(Exact.m.z = round(as.numeric(Exact.m.z), 3)) %>% group_by(Common.Name, Exact.m.z, Formula, Category, Adduct) %>% summarise(Average.Apex.RT = mean(Apex.RT), Average.Intensity = mean(Intensity))
+```
+
+## Remove duplicates of compounds that are isomers within 0.1 minutes RT
+```{r}
+#remove duplicates of compounds that are isomers within 30 seconds RT (choose highest intensity isomer); these isomers will be extracted within same EIC window
+LIQUID_batch4_RT_dupflag <- LIQUID_batch4_RT %>% ungroup() %>% group_by(Formula) %>% mutate(count = n(), RT_span = ifelse(count > 1, max(Average.Apex.RT)- min(Average.Apex.RT), NA)) 
+
+#write.csv(LIQUID_batch4_RT_dupflag, "LIQUID_batch4_flagged.csv")
+
+#remove isomers that are already labeled as _A, _B, _C in another sample or that have a more specific ID at same RT (within .1 minutes)
+to_remove <- c("PE(O-15:0/15:0)", "PE(15:0/15:1)", "PE(15:0/15:1)_A", "PE(15:0/15:1)_B", "PE(15:0/16:1)", "PE(15:0/16:1)_B", "PE(15:0/16:0)", "PE(15:0/17:1);PE(16:0/16:1)", "PE(16:0/16:1)", "PE(15:0/17:0)", "PG(15:0/15:0)", "PE(16:0/17:0)", "PE(17:1/17:1)", "PE(17:0/17:1)", "PE(17:1/18:1)", "PE(17:1/18:1)_B", "PG(16:0/17:0)", "PE(18:1/18:1)", "PE(18:0/18:1)", "PE(18:1/19:1)", "PE(19:1/19:1)", "PG(18:1/18:1)", "PG(18:0/18:1)", "PG(18:0/18:1);PG(16:0/20:1)", "PG(18:1/19:1)")
+
+LIQUID_batch4_RT_dupremov <- LIQUID_batch4_RT_dupflag %>% filter(!Common.Name %in% to_remove)
+
+#rename to combine isomers within .1 minutes 
+LIQUID_batch4_RT_dupremov <- LIQUID_batch4_RT_dupremov %>% mutate(
+  Common.Name = case_when(
+grepl("PE(14:0/16:1);PE(15:0/15:1)", Common.Name, fixed = TRUE) ~ "PE(14:0/16:1);PE(15:0/15:1)_A",
+grepl("PE(15:0/15:1);PE(14:0/16:1)", Common.Name, fixed = TRUE) ~ "PE(14:0/16:1);PE(15:0/15:1)_B",
+grepl("PE(15:0/16:1);PE(15:1/16:0)", Common.Name, fixed = TRUE) ~ "PE(15:0/16:1)_B;PE(15:1/16:0)",
+grepl("PE(15:0/17:1)", Common.Name, fixed = TRUE) ~ "PE(15:0/17:1)_A",
+grepl("PE(15:0/17:1);PE(16:0/16:1)_A", Common.Name, fixed = TRUE) ~ "PE(15:0/17:1)_B;PE(16:0/16:1)_A",
+grepl("PE(15:0/17:1);PE(16:0/16:1)_B", Common.Name, fixed = TRUE) ~ "PE(15:0/17:1)_C;PE(16:0/16:1)_B",
+grepl("PE(15:0/17:0);PE(16:0/16:0)", Common.Name, fixed = TRUE) ~ "PE(15:0/17:0);PE(16:0/16:0)_A",
+grepl("PE(16:0/16:0)", Common.Name, fixed = TRUE) ~ "PE(16:0/16:0)_B",
+grepl("PE(15:0/18:0);PE(16:0/17:0)", Common.Name, fixed = TRUE) ~ "PE(15:0/18:0)",
+grepl("PE(16:1/19:1)", Common.Name, fixed = TRUE) ~ "PE(16:1/19:1)_B",
+grepl("PE(16:1/19:1);PE(17:1/18:1)", Common.Name, fixed = TRUE) ~ "PE(16:1/19:1)_A;PE(17:1/18:1)_B",
+grepl("PI(16:0/18:0)", Common.Name, fixed = TRUE) ~ "PI(16:0/18:0)_A",
+grepl("PI(15:0/19:0);PI(16:0/18:0)", Common.Name, fixed = TRUE) ~ "PI(15:0/19:0);PI(16:0/18:0)_B",
+TRUE ~ Common.Name)
+)
+
+#select relevant columns
+neg_LIQUID_db <- LIQUID_batch4_RT_dupremov %>% select(c(Common.Name, Category, Formula, Adduct, Exact.m.z, Average.Apex.RT)) %>% dplyr::rename("rt_db" = "Average.Apex.RT", "Compound" = "Common.Name", "mz_db" = "Exact.m.z")
+
+#export
+write.csv(neg_LIQUID_db, "output/LIQUID/neg_LIQUID_db.csv")
+```

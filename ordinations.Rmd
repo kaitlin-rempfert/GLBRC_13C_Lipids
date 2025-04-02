@@ -1,0 +1,777 @@
+---
+title: "Ordinations"
+output: html_document
+date: '2022-11-02'
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r setup, echo = TRUE, message=FALSE, warning=FALSE}
+# clear workspace
+# WS = c(ls())
+# rm(WS, list = WS)
+
+# load required packages
+library(tidyverse)
+library(Rodin)
+library(ggplot2)
+library(vegan)
+library(phyloseq)
+library(ggvegan)
+library(knitr)
+library(readxl)
+library(metagenomeSeq)
+library(hilldiv)
+library(microViz)
+library(Rodin)
+library(cowplot)
+
+knitr::opts_chunk$set(echo = TRUE, cache = F)
+```
+
+# Import Data
+```{r}
+all_w_Rodin <- readRDS("output/all_w_Rodin.Rds")
+lipidomics_Rodin_meta <- readRDS("output/lipidomics_Rodin_meta.Rds")
+```
+
+# Intact Lipids
+## Not filtered for sig enrichment 
+### Prep data for PhyloSeq
+```{r}
+#sample dataframe
+samples_df <- all_w_Rodin %>% select(c(catalog_number, site, crop, timepoint, id)) %>% mutate(
+  timepoint_abbr = ifelse(timepoint == "2Month", "2m", "1y"),
+  block = parse_number(id),
+  sample = catalog_number,
+  type = "IPL",
+  site_crop = paste0(site, "_", crop),
+  texture = ifelse(site == "Michigan", "Sandy", "Silty"),
+  Label = paste0(crop, "_", block, " ", timepoint_abbr)) %>% distinct() %>% filter(!is.na(catalog_number)) %>% arrange(sample) %>%  tibble::column_to_rownames("sample") 
+#create vector to select only samples of interest
+samples <- rownames(samples_df)
+
+#create otu table
+##intensity
+otu_table_lipids_int <- all_w_Rodin %>% select(c(Compound, catalog_number, log2_intensity))  %>% distinct() %>% na.omit() %>% pivot_wider(id_cols = "Compound", names_from = "catalog_number", values_from = "log2_intensity") %>% dplyr::rename("otu" = "Compound") 
+row.names(otu_table_lipids_int) <- NULL
+##EAF
+otu_table_lipids_eaf <- all_w_Rodin %>% select(c(Compound, catalog_number, atomperc))  %>% distinct() %>% na.omit() %>% pivot_wider(id_cols = "Compound", names_from = "catalog_number", values_from = "atomperc") %>% dplyr::rename("otu" = "Compound") 
+row.names(otu_table_lipids_eaf) <- NULL
+##Log2FCintensity
+otu_table_lipids_fc <- all_w_Rodin %>% 
+  group_by(Compound, id) %>%
+    pivot_wider(names_from = TimePoint, values_from = c(log2_intensity)) %>%
+  arrange(Compound, sample) %>%
+  fill(`1year`, .direction = "down") %>%
+  fill(`2month`, .direction = "up") %>%
+  mutate(log2FC_intensity = `2month` - `1year`) %>% 
+  ungroup() %>%
+  select(c(Compound, catalog_number, log2FC_intensity)) %>%
+  distinct() %>% na.omit() %>% 
+  pivot_wider(id_cols = "Compound", names_from = "catalog_number", values_from = "log2FC_intensity") %>% dplyr::rename("otu" = "Compound") 
+row.names(otu_table_lipids_fc) <- NULL
+
+#create taxonomy table
+#add additional grouping variables
+lipidomics_Rodin_meta <- lipidomics_Rodin_meta %>% mutate(
+  `Sub class` = case_when(
+   `Sub class` != "" ~ `Sub class`,
+   `Double Bonds` == 0 ~ "saturated",
+   `Double Bonds` == 1 ~ "monounsaturated",
+   `Double Bonds` > 1 ~ "polyunsaturated"
+  ),
+  subclass = paste0(`Sub class`, " ", `Main class`)
+)
+
+taxonomy_lipids <- all_w_Rodin %>%
+  mutate(
+  `Sub class` = case_when(
+   `Sub class` != "" ~ `Sub class`,
+   `Double Bonds` == 0 ~ "saturated",
+   `Double Bonds` == 1 ~ "monounsaturated",
+   `Double Bonds` > 1 ~ "polyunsaturated"
+  ),
+  subclass = paste0(`Sub class`, " ", `Main class`)
+) %>% 
+  select(c(Compound, Category, `Main class`, subclass)) %>% distinct() %>% dplyr::rename("otu" = "Compound", "Lipid_class" = "Main class") %>% mutate(Lipid_class = ifelse(is.na(Lipid_class), "HA", Lipid_class), Category = ifelse(is.na(Category), "Fatty acyls", Category))
+row.names(taxonomy_lipids) <- NULL
+
+#convert otu table and taxonomy table to matrices
+otu_mat_lipids_int <- otu_table_lipids_int %>% tibble::column_to_rownames("otu") %>% select(sort(names(.))) %>% replace(is.na(.), 0) %>% as.matrix()
+
+otu_mat_lipids_eaf <- otu_table_lipids_eaf %>% tibble::column_to_rownames("otu") %>% select(sort(names(.))) %>% replace(is.na(.), 0) %>% as.matrix()
+
+otu_mat_lipids_fc <- otu_table_lipids_fc %>% tibble::column_to_rownames("otu") %>% select(sort(names(.))) %>% replace(is.na(.), 0) %>% as.matrix()
+
+tax_mat_lipids <- taxonomy_lipids %>%  tibble::column_to_rownames("otu") %>% as.matrix() 
+```
+
+### Read data into PhyloSeq
+```{r}
+ OTU_int = otu_table(otu_mat_lipids_int, taxa_are_rows = TRUE)
+ OTU_eaf = otu_table(otu_mat_lipids_eaf, taxa_are_rows = TRUE)
+OTU_fc = otu_table(otu_mat_lipids_fc, taxa_are_rows = TRUE)
+ TAX = tax_table(tax_mat_lipids)
+ samples = sample_data(samples_df)
+  
+ps_lipids_int <- phyloseq(OTU_int, TAX, samples)
+ps_lipids_eaf <- phyloseq(OTU_eaf, TAX, samples)
+ps_lipids_fc <- phyloseq(OTU_fc, TAX, samples)
+```
+
+### PCA with loadings - intensity
+```{r}
+paired_2 <- c("#1F78B4", "#E31A1C")
+
+ps_lipids_int %>% 
+  tax_transform("compositional", rank = "Lipid_class") %>% 
+  # when no distance matrix or constraints are supplied, PCA is the default/auto ordination method
+  ord_calc() %>% 
+  ord_plot(color = "texture", shape = "timepoint_abbr", plot_taxa = 1:8, size = 2) +
+  scale_shape_manual(values = c(
+    `1y` = "circle", 
+    `2m` = "circle open")) +
+  labs(caption = NULL, color = "Soil Texture", shape = "Timepoint") +
+  scale_colour_manual(values = paired_2)
+```
+
+### NMDS - Intensity
+```{r}
+ps_lipids_int %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("bray") %>% 
+  ord_calc("NMDS") %>% 
+  ord_plot(color = "texture", shape = "timepoint_abbr", size = 2) +
+    scale_shape_manual(values = c(
+    `1y` = "circle", 
+    `2m` = "circle open")) +
+  labs(caption = "NMDS of Bray-Curtis distances; stress = 0.053", color = "Soil Texture", shape = "Timepoint", title = "Log2 Lipid Peak Intensity") +
+   scale_colour_manual(values = paired_2)
+
+ ps_lipids_int %>%
+  #tax_filter(min_prevalence = 2.5 / 100, verbose = FALSE) %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("bray") %>% 
+  dist_permanova(variables = c("timepoint", "texture"), n_perms = 999, seed = 123) %>%
+  perm_get()
+
+ ps_lipids_int %>%
+   ps_filter(texture == "Silty") %>%
+  #tax_filter(min_prevalence = 2.5 / 100, verbose = FALSE) %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("bray") %>% 
+  dist_permanova(variables = c("timepoint"), n_perms = 999, seed = 123) %>%
+  perm_get()
+ 
+ #add this to look at interactions 
+  ps_lipids_int %>%
+  #tax_filter(min_prevalence = 2.5 / 100, verbose = FALSE) %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("bray") %>% 
+  dist_permanova(variables = c("timepoint", "site"), interactions = "site*timepoint", n_perms = 999, seed = 123) %>%
+  perm_get()
+```
+
+### NMDS - EAF
+```{r}
+ps_lipids_eaf %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("euclidean") %>% 
+  ord_calc("PCoA") %>% 
+  ord_plot(color = "texture", shape = "timepoint_abbr", size = 2) +
+    scale_shape_manual(values = c(
+    `1y` = "circle", 
+    `2m` = "circle open")) +
+  labs(color = "Soil Texture", shape = "Timepoint", title = "Lipid EAF", caption = "PCoA of Euclidean distances") +
+   scale_colour_manual(values = paired_2)
+
+ ps_lipids_eaf %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("euclidean") %>% 
+  dist_permanova(variables = c("timepoint", "texture"), n_perms = 999, seed = 123) %>%
+  perm_get()
+
+ #add this to look at interactions 
+  ps_lipids_eaf %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("euclidean") %>% 
+  dist_permanova(variables = c("timepoint", "texture"), interactions = "texture*timepoint", n_perms = 999, seed = 123) %>%
+  perm_get()
+```
+
+### NMDS - FC
+```{r}
+ps_lipids_fc %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("euclidean") %>% 
+  ord_calc("PCoA") %>% 
+  ord_plot(color = "texture", size = 2) +
+  labs(color = "Soil Texture", title = "Lipid log2FC Intensity", caption = "PCoA of Euclidean distances") +
+   scale_colour_manual(values = paired_2)
+
+ ps_lipids_fc %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("euclidean") %>% 
+  dist_permanova(variables = c("texture"), n_perms = 999, seed = 123) %>%
+  perm_get()
+```
+
+
+# Intact Lipids
+## Filtered for sig enrichment 
+### Filter by has enrichment data and significant enrichment 
+```{r}
+combined_SIP <- readRDS("output/combined_SIP_4_23.RDS")
+
+uniq_sig_intact <- combined_SIP %>% filter(p.signif != "ns") %>% select(Compound) %>% distinct() 
+uniq_sig_intact_vec <- uniq_sig_intact$Compound
+
+all_w_Rodin_en <- all_w_Rodin %>% filter(Compound %in% uniq_sig_intact_vec) 
+```
+### Prep data for PhyloSeq
+```{r}
+##Note: need to filter by confidently labeled lipids 
+
+#sample dataframe
+samples_df <- all_w_Rodin_en %>% select(c(catalog_number, site, crop, timepoint, id)) %>% mutate(
+  timepoint_abbr = ifelse(timepoint == "2Month", "2m", "1y"),
+  block = parse_number(id),
+  sample = catalog_number,
+  type = "IPL",
+  site_crop = paste0(site, "_", crop),
+  texture = ifelse(site == "Michigan", "Sandy", "Silty"),
+  texture_time = paste0(texture, "", timepoint_abbr),
+  Label = paste0(crop, "_", block, " ", timepoint_abbr)) %>% distinct() %>% filter(!is.na(catalog_number)) %>% arrange(sample) %>%  tibble::column_to_rownames("sample") 
+#create vector to select only samples of interest
+samples <- rownames(samples_df)
+
+#create otu table
+##intensity
+otu_table_lipids_int <- all_w_Rodin_en %>% select(c(Compound, catalog_number, log2_intensity))  %>% distinct() %>% na.omit() %>% pivot_wider(id_cols = "Compound", names_from = "catalog_number", values_from = "log2_intensity") %>% dplyr::rename("otu" = "Compound") 
+row.names(otu_table_lipids_int) <- NULL
+##EAF
+otu_table_lipids_eaf <- all_w_Rodin_en %>% select(c(Compound, catalog_number, atomperc))  %>% distinct() %>% na.omit() %>% pivot_wider(id_cols = "Compound", names_from = "catalog_number", values_from = "atomperc") %>% dplyr::rename("otu" = "Compound") 
+row.names(otu_table_lipids_eaf) <- NULL
+##Log2FCintensity
+otu_table_lipids_fc <- all_w_Rodin_en %>% 
+  group_by(Compound, id) %>%
+    pivot_wider(names_from = TimePoint, values_from = c(log2_intensity)) %>%
+  arrange(Compound, sample) %>%
+  fill(`1year`, .direction = "down") %>%
+  fill(`2month`, .direction = "up") %>%
+  mutate(log2FC_intensity = `2month` - `1year`) %>% 
+  ungroup() %>%
+  select(c(Compound, catalog_number, log2FC_intensity)) %>%
+  distinct() %>% na.omit() %>% 
+  pivot_wider(id_cols = "Compound", names_from = "catalog_number", values_from = "log2FC_intensity") %>% dplyr::rename("otu" = "Compound") 
+row.names(otu_table_lipids_fc) <- NULL
+
+#create taxonomy table
+taxonomy_lipids <- all_w_Rodin_en %>%
+  mutate(
+  `Sub class` = case_when(
+   `Sub class` != "" ~ `Sub class`,
+   `Double Bonds` == 0 ~ "saturated",
+   `Double Bonds` == 1 ~ "monounsaturated",
+   `Double Bonds` > 1 ~ "polyunsaturated"
+  ),
+  subclass = paste0(`Sub class`, " ", `Main class`)
+) %>% 
+  select(c(Compound, Category, `Main class`, subclass)) %>% distinct() %>% dplyr::rename("otu" = "Compound", "Lipid_class" = "Main class") %>% mutate(Lipid_class = ifelse(is.na(Lipid_class), "HA", Lipid_class), Category = ifelse(is.na(Category), "Fatty acyls", Category))
+row.names(taxonomy_lipids) <- NULL
+
+#convert otu table and taxonomy table to matrices
+otu_mat_lipids_int <- otu_table_lipids_int %>% tibble::column_to_rownames("otu") %>% select(sort(names(.))) %>% replace(is.na(.), 0) %>% as.matrix()
+
+otu_mat_lipids_eaf <- otu_table_lipids_eaf %>% tibble::column_to_rownames("otu") %>% select(sort(names(.))) %>% replace(is.na(.), 0) %>% as.matrix()
+
+otu_mat_lipids_fc <- otu_table_lipids_fc %>% tibble::column_to_rownames("otu") %>% select(sort(names(.))) %>% replace(is.na(.), 0) %>% as.matrix()
+
+tax_mat_lipids <- taxonomy_lipids %>%  tibble::column_to_rownames("otu") %>% as.matrix() 
+```
+
+### Read data into PhyloSeq
+```{r}
+ OTU_int = otu_table(otu_mat_lipids_int, taxa_are_rows = TRUE)
+ OTU_eaf = otu_table(otu_mat_lipids_eaf, taxa_are_rows = TRUE)
+ OTU_fc = otu_table(otu_mat_lipids_fc, taxa_are_rows = TRUE)
+ TAX = tax_table(tax_mat_lipids)
+ samples = sample_data(samples_df)
+  
+ps_lipids_int <- phyloseq(OTU_int, TAX, samples)
+ps_lipids_eaf <- phyloseq(OTU_eaf, TAX, samples)
+ps_lipids_fc <- phyloseq(OTU_fc, TAX, samples)
+```
+
+### PCA with loadings - intensity
+```{r}
+paired_2 <- c("#1F78B4", "#E31A1C")
+
+ps_lipids_int %>% 
+  tax_transform("compositional", rank = "Lipid_class") %>% 
+  # when no distance matrix or constraints are supplied, PCA is the default/auto ordination method
+  ord_calc() %>% 
+  ord_plot(color = "texture", shape = "timepoint_abbr", plot_taxa = 1:8, size = 2) +
+  scale_shape_manual(values = c(
+    `1y` = "circle", 
+    `2m` = "circle open")) +
+  labs(caption = NULL, color = "Soil Texture", shape = "Timepoint") +
+  scale_colour_manual(values = paired_2)
+```
+
+### NMDS - Intensity
+```{r}
+nmds_int <- ps_lipids_int %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("bray") %>% 
+  ord_calc("NMDS") %>% 
+  ord_plot(color = "texture", shape = "timepoint_abbr", size = 2) +
+    scale_shape_manual(values = c(
+    `1y` = "circle", 
+    `2m` = "circle open")) +
+  labs(caption = "NMDS of Bray-Curtis distances; stress = 0.053", color = "Soil Texture", shape = "Timepoint", title = "Log2 Lipid Peak Intensity") +
+   scale_colour_manual(values = paired_2)
+
+ ps_lipids_int %>%
+  #tax_filter(min_prevalence = 2.5 / 100, verbose = FALSE) %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("bray") %>% 
+  dist_permanova(variables = c("timepoint", "texture"), n_perms = 999, seed = 123) %>%
+  perm_get()
+ 
+  ps_lipids_int %>%
+   ps_filter(texture == "Sandy") %>%
+  #tax_filter(min_prevalence = 2.5 / 100, verbose = FALSE) %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("bray") %>% 
+  dist_permanova(variables = c("timepoint"), n_perms = 999, seed = 123) %>%
+  perm_get()
+
+ #add this to look at interactions 
+  ps_lipids_int %>%
+  #tax_filter(min_prevalence = 2.5 / 100, verbose = FALSE) %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("bray") %>% 
+  dist_permanova(variables = c("timepoint", "site"), interactions = "site*timepoint", n_perms = 999, seed = 123) %>%
+  perm_get()
+```
+
+### NMDS - EAF
+```{r}
+nmds_eaf <- 
+  ps_lipids_eaf %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("euclidean") %>% 
+  ord_calc("PCoA") %>% 
+  ord_plot(color = "texture", shape = "timepoint_abbr", size = 2) +
+    scale_shape_manual(values = c(
+    `1y` = "circle", 
+    `2m` = "circle open")) +
+  labs(color = "Soil Texture", shape = "Timepoint", title = "Lipid EAF", caption = "PCoA of Euclidean distances") +
+   scale_colour_manual(values = paired_2)
+
+ ps_lipids_eaf %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("euclidean") %>% 
+  dist_permanova(variables = c("timepoint", "texture"), n_perms = 999, seed = 123) %>%
+  perm_get()
+
+ #add this to look at interactions 
+  ps_lipids_eaf %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("euclidean") %>% 
+  dist_permanova(variables = c("timepoint", "texture"), interactions = "texture*timepoint", n_perms = 999, seed = 123) %>%
+  perm_get()
+  
+plot_grid(nmds_int, nmds_eaf, labels = c('A', 'B'), ncol = 1)
+```
+
+### NMDS - FC
+```{r}
+ps_lipids_fc %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("gower") %>% 
+  ord_calc("PCoA") %>% 
+  ord_plot(color = "texture", size = 2) +
+  labs(color = "Soil Texture", title = "Lipid log2FC Intensity", caption = "PCoA of Euclidean distances") +
+   scale_colour_manual(values = paired_2)
+
+ ps_lipids_fc %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("gower") %>% 
+  dist_permanova(variables = c("texture"), n_perms = 999, seed = 123) %>%
+  perm_get()
+```
+
+### attempt at pairwise adonis 
+```{r}
+groups <- as.character(samples_df$texture_time)
+texture <- as.character(samples_df$texture)
+time <- as.character(samples_df$timepoint)
+samplenum <- as.character(samples_df$catalog_number)
+
+pw_int <- pairwise_permanova(t(otu_mat_lipids_int), groups, dist = "euclidean")
+
+otu_mat_lipids_int
+#convert otu table and taxonomy table to matrices
+otu_mat_lipids_PC_int <- otu_table_lipids_int %>%
+  select(c(otu)| matches(samplenum)) %>%
+  filter(grepl("PC", otu)) %>%  
+  tibble::column_to_rownames("otu") %>% select(sort(names(.))) %>% replace(is.na(.), 0) %>% as.matrix()
+
+pw_pc_int <- pairwise_permanova(t(otu_mat_lipids_PC_int), time, dist = "euclidean")
+```
+
+# Intact Lipids - Compositional
+## Filtered for sig enrichment 
+### Filter by has enrichment data and significant enrichment 
+```{r}
+combined_SIP <- readRDS("output/combined_SIP_4_23.RDS")
+
+uniq_sig_intact <- combined_SIP %>% filter(p.signif != "ns") %>% select(Compound) %>% distinct() 
+uniq_sig_intact_vec <- uniq_sig_intact$Compound
+
+all_w_Rodin_en <- all_w_Rodin %>% filter(Compound %in% uniq_sig_intact_vec) 
+```
+### Prep data for PhyloSeq
+```{r}
+##Note: need to filter by confidently labeled lipids 
+all_w_Rodin_class_en <- all_w_Rodin_en %>%
+  mutate(
+  `Sub class` = case_when(
+   `Sub class` != "" ~ `Sub class`,
+   `Double Bonds` == 0 ~ "saturated",
+   `Double Bonds` == 1 ~ "monounsaturated",
+   `Double Bonds` > 1 ~ "polyunsaturated"
+  ),
+  subclass = paste0(`Sub class`, " ", `Main class`)
+) 
+
+#sample dataframe
+samples_df <- all_w_Rodin_class_en %>% select(c(catalog_number, site, crop, timepoint, id)) %>% mutate(
+  timepoint_abbr = ifelse(timepoint == "2Month", "2m", "1y"),
+  block = parse_number(id),
+  sample = catalog_number,
+  type = "IPL",
+  site_crop = paste0(site, "_", crop),
+  texture = ifelse(site == "Michigan", "Sandy", "Silty"),
+  Label = paste0(crop, "_", block, " ", timepoint_abbr)) %>% distinct() %>% filter(!is.na(catalog_number)) %>% arrange(sample) %>%  tibble::column_to_rownames("sample") 
+#create vector to select only samples of interest
+samples <- rownames(samples_df)
+
+#create otu table
+##intensity
+otu_table_lipids_int <- all_w_Rodin_class_en %>% select(c(Compound, subclass, catalog_number, log2_intensity)) %>% distinct() %>% na.omit() %>% group_by(catalog_number, subclass) %>% summarize(log2_intensity = mean(log2_intensity, na.rm = TRUE)) %>% filter(subclass != "NA NA") %>% pivot_wider(id_cols = "subclass", names_from = "catalog_number", values_from = "log2_intensity") %>% dplyr::rename("otu" = "subclass") 
+row.names(otu_table_lipids_int) <- NULL
+##EAF
+otu_table_lipids_eaf <- all_w_Rodin_class_en %>% select(c(Compound, subclass, catalog_number, atomperc)) %>% distinct() %>% na.omit() %>% group_by(catalog_number, subclass) %>% summarize(atomperc = mean(atomperc, na.rm = TRUE)) %>% filter(subclass != "NA NA") %>% pivot_wider(id_cols = "subclass", names_from = "catalog_number", values_from = "atomperc") %>% dplyr::rename("otu" = "subclass") 
+row.names(otu_table_lipids_eaf) <- NULL
+##Log2FCintensity
+otu_table_lipids_fc <- all_w_Rodin_class_en %>% 
+  group_by(Compound, id) %>%
+    pivot_wider(names_from = TimePoint, values_from = c(log2_intensity)) %>%
+  arrange(Compound, sample) %>%
+  fill(`1year`, .direction = "down") %>%
+  fill(`2month`, .direction = "up") %>%
+  mutate(log2FC_intensity = `2month` - `1year`) %>% 
+  ungroup() %>%
+  select(c(Compound, subclass, catalog_number, log2FC_intensity)) %>%
+  distinct() %>% na.omit() %>% 
+  group_by(catalog_number, subclass) %>% summarize(log2FC_intensity = mean(log2FC_intensity, na.rm = TRUE)) %>% filter(subclass != "NA NA") %>% pivot_wider(id_cols = "subclass", names_from = "catalog_number", values_from = "log2FC_intensity") %>% dplyr::rename("otu" = "subclass") 
+row.names(otu_table_lipids_fc) <- NULL
+
+#create taxonomy table
+taxonomy_lipids <- all_w_Rodin_class_en %>% 
+  select(c(Category, `Main class`, subclass)) %>% distinct() %>% filter(subclass != "NA NA") %>% dplyr::rename("otu" = "subclass", "Lipid_class" = "Main class") %>% mutate(Lipid_class = ifelse(is.na(Lipid_class), "HA", Lipid_class), Category = ifelse(is.na(Category), "Fatty acyls", Category))
+row.names(taxonomy_lipids) <- NULL
+
+#convert otu table and taxonomy table to matrices
+otu_mat_lipids_int <- otu_table_lipids_int %>% tibble::column_to_rownames("otu") %>% select(sort(names(.))) %>% replace(is.na(.), 0) %>% as.matrix()
+
+otu_mat_lipids_eaf <- otu_table_lipids_eaf %>% tibble::column_to_rownames("otu") %>% select(sort(names(.))) %>% replace(is.na(.), 0) %>% as.matrix()
+
+otu_mat_lipids_fc <- otu_table_lipids_fc %>% tibble::column_to_rownames("otu") %>% select(sort(names(.))) %>% replace(is.na(.), 0) %>% as.matrix()
+
+tax_mat_lipids <- taxonomy_lipids %>%  tibble::column_to_rownames("otu") %>% as.matrix() 
+```
+
+### Read data into PhyloSeq
+```{r}
+ OTU_int = otu_table(otu_mat_lipids_int, taxa_are_rows = TRUE)
+ OTU_eaf = otu_table(otu_mat_lipids_eaf, taxa_are_rows = TRUE)
+ OTU_fc = otu_table(otu_mat_lipids_fc, taxa_are_rows = TRUE)
+ TAX = tax_table(tax_mat_lipids)
+ samples = sample_data(samples_df)
+  
+ps_lipids_int <- phyloseq(OTU_int, TAX, samples)
+ps_lipids_eaf <- phyloseq(OTU_eaf, TAX, samples)
+ps_lipids_fc <- phyloseq(OTU_fc, TAX, samples)
+```
+
+
+### NMDS - Intensity
+```{r}
+ps_lipids_int %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("bray") %>% 
+  ord_calc("NMDS") %>% 
+  ord_plot(color = "texture", shape = "timepoint_abbr", size = 2) +
+    scale_shape_manual(values = c(
+    `1y` = "circle", 
+    `2m` = "circle open")) +
+  labs(caption = "NMDS of Bray-Curtis distances; stress = 0.053", color = "Soil Texture", shape = "Timepoint", title = "Log2 Lipid Peak Intensity") +
+   scale_colour_manual(values = paired_2)
+
+ ps_lipids_int %>%
+  #tax_filter(min_prevalence = 2.5 / 100, verbose = FALSE) %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("bray") %>% 
+  dist_permanova(variables = c("timepoint", "texture"), n_perms = 999, seed = 123) %>%
+  perm_get()
+
+ #add this to look at interactions 
+  ps_lipids_int %>%
+  #tax_filter(min_prevalence = 2.5 / 100, verbose = FALSE) %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("bray") %>% 
+  dist_permanova(variables = c("timepoint", "site"), interactions = "site*timepoint", n_perms = 999, seed = 123) %>%
+  perm_get()
+```
+
+### NMDS - EAF
+```{r}
+ps_lipids_eaf %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("euclidean") %>% 
+  ord_calc("PCoA") %>% 
+  ord_plot(color = "texture", shape = "timepoint_abbr", size = 2) +
+    scale_shape_manual(values = c(
+    `1y` = "circle", 
+    `2m` = "circle open")) +
+  labs(color = "Soil Texture", shape = "Timepoint", title = "Lipid EAF", caption = "PCoA of Euclidean distances") +
+   scale_colour_manual(values = paired_2)
+
+ ps_lipids_eaf %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("euclidean") %>% 
+  dist_permanova(variables = c("timepoint", "texture"), n_perms = 999, seed = 123) %>%
+  perm_get()
+
+ #add this to look at interactions 
+  ps_lipids_eaf %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("euclidean") %>% 
+  dist_permanova(variables = c("timepoint", "texture"), interactions = "texture*timepoint", n_perms = 999, seed = 123) %>%
+  perm_get()
+```
+
+### NMDS - FC
+```{r}
+ps_lipids_fc %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("euclidean") %>% 
+  ord_calc("PCoA") %>% 
+  ord_plot(color = "texture", size = 2) +
+  labs(color = "Soil Texture", title = "Lipid log2FC Intensity", caption = "PCoA of Euclidean distances") +
+   scale_colour_manual(values = paired_2)
+
+ ps_lipids_fc %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("euclidean") %>% 
+  dist_permanova(variables = c("texture"), n_perms = 999, seed = 123) %>%
+  perm_get()
+```
+
+
+# PLFAs
+## Import Data
+```{r}
+#read in abundance data (nmoles per g dry soil)
+mylipidData <- readRDS("output/mylipidData_PLFAs.rds")
+#read in enrichment data from pmartR
+mylipidData_enrichment <- readRDS("output/mylipidData_PLFA_enrichment.rds")
+
+#import metadata file 
+meta <- readxl::read_excel("incubation_metadata_w_qc.xlsx")
+
+plfa_meta <- readRDS("output/plfa_meta.rds")
+```
+
+# Pull out data from LipidObject
+```{r}
+#pull out e data and e-meta 
+lipid_e_int <- mylipidData[["e_data"]]
+lipid_e_eaf <- mylipidData_enrichment[["e_data"]]
+```
+
+
+```{r}
+samples_df <- meta %>% filter(crop == "Switchgrass" & amendment == "13C_Gluc" & polarity == "positive") %>% 
+  select(c(catalog_number, site, crop, timepoint, block)) %>% mutate(
+  timepoint_abbr = ifelse(timepoint == "2Month", "2m", "1y"),
+  block = parse_number(block),
+  sample = catalog_number,
+  type = "PLFA",
+  site_crop = paste0(site, "_", crop),
+  site_label = ifelse(site == "Michigan", "MS", "WS"),
+  id = paste0(site_label, "_", timepoint_abbr, "_", block),
+  id2 = paste0(site, "_", block),
+  texture = ifelse(site == "Michigan", "Sandy", "Silty"),
+  Label = paste0(crop, "_", block, " ", timepoint_abbr)) %>% distinct() %>% filter(!is.na(catalog_number)) %>% arrange(sample) %>%  tibble::column_to_rownames("sample") 
+#create vector to select only samples of interest
+samples <- rownames(samples_df)
+
+#create otu table
+##intensity 
+otu_table_lipids_int <- lipid_e_int %>% select(c(Compound | matches(samples))) %>% dplyr::rename("otu" = "Compound") 
+row.names(otu_table_lipids_int) <- NULL
+
+##EAF
+otu_table_lipids_eaf <- lipid_e_eaf %>% pivot_longer(cols = -Compound, names_to = "id", values_to = "eaf") %>% left_join(., samples_df %>% select(c(id, catalog_number))) %>% filter(!is.na(catalog_number)) %>% select(-id) %>% pivot_wider(names_from = "catalog_number", values_from = "eaf") %>% dplyr::rename("otu" = "Compound") 
+row.names(otu_table_lipids_eaf) <- NULL
+
+##Log2FCintensity
+otu_table_lipids_fc <- lipid_e_int %>% pivot_longer(cols = -Compound, names_to = "catalog_number", values_to = "nmoles") %>% left_join(., samples_df %>% select(c(id2, timepoint, catalog_number))) %>% filter(!is.na(id2)) %>% group_by(Compound, id2) %>%
+  pivot_wider(names_from = timepoint, values_from = c(nmoles)) %>%
+  arrange(Compound, id2) %>%
+  fill(`Final`, .direction = "up") %>%
+  fill(`2Month`, .direction = "down") %>%
+  mutate(log2FC = log2(`Final`) - log2(`2Month`)) %>% 
+  ungroup() %>%
+  select(c(Compound, catalog_number, log2FC)) %>%
+  distinct() %>% na.omit() %>%
+  pivot_wider(id_cols = "Compound", names_from = "catalog_number", values_from = "log2FC") %>% dplyr::rename("otu" = "Compound") 
+row.names(otu_table_lipids_fc) <- NULL
+
+#create taxonomy table
+taxonomy_lipids <- plfa_meta %>% select(c(Fraction, Type, Marker)) %>% dplyr::rename("otu" = "Fraction")
+row.names(taxonomy_lipids) <- NULL
+
+#convert otu table and taxonomy table to matrices
+otu_mat_lipids_int <- otu_table_lipids_int %>% tibble::column_to_rownames("otu") %>% select(sort(names(.))) %>% replace(is.na(.), 0) %>% as.matrix()
+
+otu_mat_lipids_eaf <- otu_table_lipids_eaf %>% tibble::column_to_rownames("otu") %>% select(sort(names(.))) %>% replace(is.na(.), 0) %>% as.matrix()
+
+otu_mat_lipids_fc <- otu_table_lipids_fc %>% tibble::column_to_rownames("otu") %>% select(sort(names(.))) %>% replace(is.na(.), 0) %>% as.matrix()
+
+tax_mat_lipids <- taxonomy_lipids %>%  tibble::column_to_rownames("otu") %>% as.matrix() 
+```
+
+### Read data into PhyloSeq
+```{r}
+ OTU_int = otu_table(otu_mat_lipids_int, taxa_are_rows = TRUE)
+ OTU_eaf = otu_table(otu_mat_lipids_eaf, taxa_are_rows = TRUE)
+ OTU_fc = otu_table(otu_mat_lipids_fc, taxa_are_rows = TRUE)
+
+ TAX = tax_table(tax_mat_lipids)
+ samples = sample_data(samples_df)
+  
+ps_lipids_int <- phyloseq(OTU_int, TAX, samples)
+ps_lipids_eaf <- phyloseq(OTU_eaf, TAX, samples)
+ps_lipids_fc <- phyloseq(OTU_fc, TAX, samples)
+```
+
+### PCA with loadings - intensity
+```{r}
+
+ps_lipids_int %>% 
+  tax_transform("compositional", rank = "Type") %>% 
+  # when no distance matrix or constraints are supplied, PCA is the default/auto ordination method
+  ord_calc() %>% 
+  ord_plot(color = "texture", shape = "timepoint_abbr", plot_taxa = 1:8, size = 2) +
+  scale_shape_manual(values = c(
+    `1y` = "circle", 
+    `2m` = "circle open")) +
+  labs(caption = NULL, color = "Soil Texture", shape = "Timepoint") +
+  scale_colour_manual(values = paired_2)
+```
+
+
+### NMDS - Intensity
+```{r}
+nmds_plfas_int <- ps_lipids_int %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("bray") %>% 
+  ord_calc("NMDS") %>% 
+  ord_plot(color = "texture", shape = "timepoint_abbr", size = 2) +
+    scale_shape_manual(values = c(
+    `1y` = "circle", 
+    `2m` = "circle open")) +
+  labs(caption = "NMDS of Bray-Curtis distances; stress = 0.025", color = "Soil Texture", shape = "Timepoint", title = "PLFA nmoles per g dry soil") +
+   scale_colour_manual(values = paired_2)
+
+ ps_lipids_int %>%
+  #tax_filter(min_prevalence = 2.5 / 100, verbose = FALSE) %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("bray") %>% 
+  dist_permanova(variables = c("timepoint", "texture"), n_perms = 999, seed = 123) %>%
+  perm_get()
+ 
+  ps_lipids_int %>%
+   ps_filter(texture == "Silty") %>%
+  #tax_filter(min_prevalence = 2.5 / 100, verbose = FALSE) %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("bray") %>% 
+  dist_permanova(variables = c("timepoint"), n_perms = 999, seed = 123) %>%
+  perm_get()
+
+ #add this to look at interactions 
+  ps_lipids_int %>%
+  #tax_filter(min_prevalence = 2.5 / 100, verbose = FALSE) %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("bray") %>% 
+  dist_permanova(variables = c("timepoint", "site"), interactions = "site*timepoint", n_perms = 999, seed = 123) %>%
+  perm_get()
+```
+
+### NMDS - EAF
+```{r}
+nmds_plfas_eaf <- ps_lipids_eaf %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("euclidean") %>% 
+  ord_calc("PCoA") %>% 
+  ord_plot(color = "texture", shape = "timepoint_abbr", size = 2) +
+    scale_shape_manual(values = c(
+    `1y` = "circle", 
+    `2m` = "circle open")) +
+  labs(color = "Soil Texture", shape = "Timepoint", title = "PLFA EAF", caption = "PCoA of Euclidean distances") +
+   scale_colour_manual(values = paired_2)
+
+ ps_lipids_eaf %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("euclidean") %>% 
+  dist_permanova(variables = c("timepoint", "texture"), n_perms = 999, seed = 123) %>%
+  perm_get()
+
+ #add this to look at interactions 
+  ps_lipids_eaf %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("euclidean") %>% 
+  dist_permanova(variables = c("timepoint", "texture"), interactions = "texture*timepoint", n_perms = 999, seed = 123) %>%
+  perm_get()
+  
+plot_grid(nmds_plfas_int, nmds_plfas_eaf, ncol = 1, labels = c('A', 'B')) 
+```
+
+### NMDS - FC
+```{r}
+ps_lipids_fc %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("gower") %>% 
+  ord_calc("PCoA") %>% 
+  ord_plot(color = "texture", size = 2) +
+  labs(color = "Soil Texture", title = "PLFA log2FC (nmoles)", caption = "PCoA of Euclidean distances") +
+   scale_colour_manual(values = paired_2)
+
+ ps_lipids_fc %>%
+  tax_transform("identity") %>% # don't transform!
+  dist_calc("gower") %>% 
+  dist_permanova(variables = c("texture"), n_perms = 999, seed = 123) %>%
+  perm_get()
+```

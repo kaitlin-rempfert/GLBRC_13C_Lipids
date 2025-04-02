@@ -1,0 +1,396 @@
+---
+title: "Lipidomics Heatmaps"
+author: "Kaitlin Rempfert"
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+output:
+  html_document:
+    df_print: paged
+    number_sections: yes
+    css: stylesheet.css
+    toc: yes
+    toc_float: yes
+    toc_depth: 3
+    code_folding: show
+subtitle: Starting from annotated peaklist
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, echo = TRUE, message=FALSE, warning=FALSE}
+# clear workspace
+# WS = c(ls())
+# rm(WS, list = WS)
+
+# load required packages
+library(tidyverse)
+library(ggplot2)
+library(knitr)
+library(readxl)
+library(hilldiv)
+library(Rodin)
+library(Cairo)
+library(ComplexHeatmap)
+library(GetoptLong)
+library(mdatools)
+
+knitr::opts_chunk$set(echo = TRUE, cache = F)
+```
+
+
+# Abundance + Enrichment Heatmap (Only labeled reps)
+## Load data
+```{r}
+all_w_Rodin <- readRDS("output/all_w_Rodin.Rds")
+```
+
+## Create abundance heatmap (separating by site)...then try separating by crop or timepoint??
+```{r}
+#reorder data (MI switchgrass 2 month, MI switchgrass 1 year...then WI with same pattern)
+#first pivot data to create columns for each group_rep
+lipids_ordered <- all_w_Rodin %>% select(c(group_rep, Compound, `Main class`, `Sub class`, `Total Number of Carbon`, `Double Bonds`, `Mean # of C per chain`, `Mean DBE per chain`, DBE, Hydroxylations, `Backbone linkage`, Category, classification, atomperc, log2_intensity)) %>% 
+#remove any rows with NA values 
+  na.omit() %>%
+  mutate(classification = factor(classification, levels = c("persistent", "continued production", "degraded",  "unclassified"))) %>%
+  ungroup() %>%
+  pivot_wider(names_from = group_rep, values_from = c(atomperc, log2_intensity)) %>%
+  na.omit() %>%
+  filter(`Main class` != "CoQ") %>%
+  group_by(Category, `Main class`) %>% arrange(Category, `Main class`, `Total Number of Carbon`, `Double Bonds`) 
+#create dataframe for intensity
+intensity_ordered <- lipids_ordered %>% select(c(Category, Compound, `Main class`, `Sub class`, `Total Number of Carbon`, `Double Bonds`, `Mean # of C per chain`, `Mean DBE per chain`, DBE, Hydroxylations, `Backbone linkage`, classification, starts_with("log2_intensity_MS_2m"), starts_with("log2_intensity_MS_1y"), starts_with("log2_intensity_WS_2m"), starts_with("log2_intensity_WS_1y")))
+#create dataframe for enrichment
+enrichment_ordered <- lipids_ordered %>% select(c(Category, Compound, `Main class`, `Sub class`, `Total Number of Carbon`, `Double Bonds`, `Mean # of C per chain`, `Mean DBE per chain`, DBE, Hydroxylations, `Backbone linkage`, classification, starts_with("atomperc_MS_2m"), starts_with("atomperc_MS_1y"), starts_with("atomperc_WS_2m"), starts_with("atomperc_WS_1y")))
+
+#row grouping vectors
+#main class
+class1 = intensity_ordered$`Main class`
+class2 = enrichment_ordered$`Main class`
+class = lipids_ordered$`Main class`
+#category 
+category1 = intensity_ordered$Category
+category2 = enrichment_ordered$Category
+category = lipids_ordered$`Main class`
+
+
+#heatmap matrices
+mat1 = as.matrix(intensity_ordered[, grep("_", colnames(intensity_ordered))])
+#mean autoscale
+mat1_scaled = prep.autoscale(mat1, center = TRUE, scale = TRUE)
+#mean-scale (by compound)
+mat1_scaledt = t(scale(t(mat1)))
+mat1_scaledt = t(prep.autoscale(t(mat1), center = TRUE, scale = TRUE))
+
+mat2 = as.matrix(enrichment_ordered[, grep("_", colnames(enrichment_ordered))])
+#convert from atom fraction to atom percent
+mat2_perc = 100*mat2
+
+#define row and column orders
+#rownames(mat1_scaled) <- c(1:nrow(mat1_scaled))
+#colnames(mat1_scaled) <- c(1:ncol(mat1_scaled))
+#rownames(mat2_perc) <- c(1:nrow(mat2_perc))
+#colnames(mat2_perc) <- c(1:ncol(mat2_perc))
+
+
+#color functions
+#col_fun1 = circlize::colorRamp2(c(15, 40, 65), hcl_palette = "Blues", reverse = TRUE)
+col_fun1 = circlize::colorRamp2(c(0, 1, 6), c("white","#A6CEE3", "#1F78B4"))
+#col_fun2 = circlize::colorRamp2(c(0, 7.5, 15), hcl_palette = "Reds", reverse = TRUE)
+#col_fun3 <- circlize::colorRamp2(c(0, 10, 30), c("white", "yellow", "red"))
+col_fun4 <- circlize::colorRamp2(c(0, 15), c("black", "red"))
+
+col_fun3 <- circlize::colorRamp2(c(-2, 0, 2), hcl_palette = "Purple-Green")
+hcl.colors(9, palette = "Purple-Green")
+
+#row annotaiton 
+#ra = rowAnnotation(`#Carbons` = intensity_ordered$`Total Number of Carbon`, `Double Bonds` = intensity_ordered$`Double Bonds`, col = c(list(`#Carbons` = col_fun1), list(`Double Bonds` = col_fun2)),  annotation_name_rot = 45)
+#lipid class
+
+#mean chain dbe
+ra2 = rowAnnotation(`Lipid class` = anno_block(gp = gpar(fill = c("#A6CEE3", "#1F78B4", "#B2DF8A", "#33A02C", "#FB9A99", "#E31A1C", "#FDBF6F", "#FF7F00", "#CAB2D6"))), `chain DBE` = intensity_ordered$`Mean DBE per chain`, col = list(`chain DBE` = col_fun1), annotation_name_rot = 45)
+
+hm1 <- Heatmap(mat1_scaledt, 
+        name = "Mean-scaled Log2(Intensity)", 
+        #col = viridis::viridis(100),
+        col = col_fun3,
+        #row_order = order(as.numeric(rownames(mat1_scaled))), 
+        #column_order = order(as.numeric(colnames(mat1_scaled))),
+        row_split = factor(class, levels = c("PC", "PE", "PG", "PI", "Cer", "DGTSA", "DG", "TG", "FA")),
+        column_split = factor(c(rep("MI 2 months", 5), rep("MI 1 year", 5), rep("WI 2 months", 4),  rep("WI 1 year", 4)), levels = c("MI 2 months", "MI 1 year", "WI 2 months", "WI  year")),
+        top_annotation = HeatmapAnnotation(empty = anno_empty(border = FALSE), Timepoint = anno_block(gp = gpar(fill = c("#B2DF8A", "#33A02C", "#B2DF8A", "#33A02C")),
+        labels = c("2 months", "1 year", "2 months", "1 year"), 
+        labels_gp = gpar(col = "white", fontsize = 10))),
+        cluster_rows = FALSE, 
+        cluster_columns = FALSE,
+        row_dend_reorder = FALSE,
+        column_dend_reorder = FALSE,
+        cluster_row_slices = FALSE, 
+        show_row_dend = FALSE, 
+        show_column_dend = FALSE,
+        row_title_rot = 0,
+        show_row_names = FALSE,
+        show_column_name = FALSE,
+        left_annotation = ra2,
+        #width = unit(8, "cm"), height = unit(12, "cm"),
+        column_title = "Mean-scaled Lipid Abundance"
+        )
+
+viridis_map = circlize::colorRamp2(c(0, 0.5, 1, 2, 3, 4, 5, 7.5, 10, 15), viridis::viridis(10))
+
+hm2 <-  Heatmap(mat2_perc, 
+        name = "Atm% Enrichment", 
+        col = viridis_map,
+        row_split = factor(class, levels = c("PC", "PE", "PG", "PI", "Cer", "DGTSA", "DG", "TG", "FA")),
+        column_split = factor(c(rep("MI 2 months", 5), rep("MI 1 year", 5), rep("WI 2 months", 4),  rep("WI 1 year", 4)), levels = c("MI 2 months", "MI 1 year", "WI 2 months", "WI  year")),
+        top_annotation = HeatmapAnnotation(empty2 = anno_empty(border = FALSE), Timepoint = anno_block(gp = gpar(fill = c("#B2DF8A", "#33A02C", "#B2DF8A", "#33A02C")),
+        labels = c("2 months", "1 year", "2 months", "1 year"), 
+        labels_gp = gpar(col = "white", fontsize = 10))),
+        cluster_rows = FALSE, 
+        cluster_columns = FALSE,
+        row_dend_reorder = FALSE,
+        column_dend_reorder = FALSE,
+        cluster_row_slices = FALSE, 
+        show_row_dend = FALSE, 
+        show_column_dend = FALSE,
+        show_column_name = FALSE,
+        show_row_names = FALSE,
+        column_title = "Lipid Enrichment (Atom %)"
+        )
+
+ht_list = hm1 + hm2 
+ht = draw(ht_list)
+
+w = ComplexHeatmap:::width(ht)
+w = convertX(w, "inch", valueOnly = TRUE)
+h = ComplexHeatmap:::height(ht)
+h = convertY(h, "inch", valueOnly = TRUE)
+
+library(GetoptLong)  # for the function qq()
+group_block_anno = function(group, empty_anno, gp = gpar(), 
+    label = NULL, label_gp = gpar()) {
+
+    seekViewport(qq("annotation_@{empty_anno}_@{min(group)}"))
+    loc1 = deviceLoc(x = unit(0, "npc"), y = unit(0, "npc"))
+    seekViewport(qq("annotation_@{empty_anno}_@{max(group)}"))
+    loc2 = deviceLoc(x = unit(1, "npc"), y = unit(1, "npc"))
+
+    seekViewport("global")
+    grid.rect(loc1$x, loc1$y, width = loc2$x - loc1$x, height = loc2$y - loc1$y, 
+        just = c("left", "bottom"), gp = gp)
+    if(!is.null(label)) {
+        grid.text(label, x = (loc1$x + loc2$x)*0.5, y = (loc1$y + loc2$y)*0.5, gp = label_gp)
+    }
+}
+group_block_anno2 = function(group, empty_anno, gp = gpar(), 
+    label = NULL, label_gp = gpar()) {
+
+    seekViewport(qq("annotation_empty2_@{min(group)}"))
+    loc1 = deviceLoc(x = unit(0, "npc"), y = unit(0, "npc"))
+    seekViewport(qq("annotation_empty2_@{max(group)}"))
+    loc2 = deviceLoc(x = unit(1, "npc"), y = unit(1, "npc"))
+
+    seekViewport("global")
+    grid.rect(loc1$x, loc1$y, width = loc2$x - loc1$x, height = loc2$y - loc1$y, 
+        just = c("left", "bottom"), gp = gp)
+    if(!is.null(label)) {
+        grid.text(label, x = (loc1$x + loc2$x)*0.5, y = (loc1$y + loc2$y)*0.5, gp = label_gp)
+    }
+}
+
+dev.off()
+pdf("plots/Figure6.pdf", width = w, height = h)
+ht_list
+group_block_anno(1:2, "empty", gp = gpar(fill = "#1F78B4"), label = "Sandy")
+group_block_anno(3:4, "empty", gp = gpar(fill = "#E31A1C"), label = "Silty")
+group_block_anno2(1:2, "empty", gp = gpar(fill = "#1F78B4"), label = "Sandy")
+group_block_anno2(3:4, "empty", gp = gpar(fill = "#E31A1C"), label = "Silty")
+dev.off()
+```
+
+# PLFAs
+## Load data
+```{r}
+plfas_w_meta <- readRDS(file = "output/plfas_w_meta.rds")
+```
+
+## Add type labels
+```{r}
+plfa_types <- plfas_w_meta %>% mutate(Type_label = case_when(
+    grepl("Cyclopropyl", Type) ~ "Cyclo",
+    grepl("Hydroxylated", Type) ~ "Hydroxy",
+    grepl("Monounsaturated", Type) ~ "MUFA",
+    grepl("Branched monounsaturated", Type) ~ "brMUFA",
+    grepl("Polyunsaturated", Type) ~ "PUFA",
+    grepl("Saturated with mid-chain", Type) ~ "brSAFA",
+    grepl("Terminally branched saturated", Type) ~  "i/aSAFA",
+    grepl("Straight chained saturated", Type) ~  "SAFA", 
+    TRUE ~ "Other"
+  ), Type_label = factor(Type_label, levels = c("SAFA", "brSAFA", "i/aSAFA", "MUFA", "brMUFA", "PUFA", "Cyclo", "Hydroxy")),
+  Marker = factor(Marker, levels = c("Actinos", "Firmicutes", "G-", "Zygomycota", "Ascomycota and Basidiomycota", "Unspecified Fungi", "non-specific")),
+  atomperc = wt.perc.13C.excess/1.08,
+  site_abbr = ifelse(site == "Michigan", "MS", "WS"), 
+  time_abbr = ifelse(timepoint == "2month", "2m", "1y"),
+  id2 = paste0(site_abbr, "_", time_abbr, "_", parse_number(block))
+  ) %>% filter(!is.na(Type)) %>% filter(!is.na(ug.Total.C.per.g.dry.soil)) %>% dplyr::rename("Compound" = "Fraction") %>% select(-c(site_abbr, time_abbr, block, id, ug.13C.per.g.dry.soil, ug.13C.excess.per.g.dry.soil, wt.perc.13C.excess, Catalog.Number, timepoint, site, Type)) %>% dplyr::rename("Type" = "Type_label", "C" = "chain_C", "DBE" = "chain_DBE")
+```
+
+## Create heatmap 
+```{r}
+#reorder data (MI switchgrass 2 month, MI switchgrass 1 year...then WI with same pattern)
+#first pivot data to create columns for each group_rep
+lipids_ordered <- plfa_types %>% 
+#remove any rows with NA values 
+  na.omit() %>%
+  pivot_wider(names_from = id2, values_from = c(atomperc, ug.Total.C.per.g.dry.soil)) %>%
+  na.omit() %>%
+  group_by(Type) %>% arrange(Type, C, DBE) 
+#create dataframe for intensity
+intensity_ordered <- lipids_ordered %>% select(c(Type, Compound, C, DBE, Marker, num_range("ug.Total.C.per.g.dry.soil_MS_2m_", 1:5), num_range("ug.Total.C.per.g.dry.soil_MS_1y_", 1:5), num_range("ug.Total.C.per.g.dry.soil_WS_2m_", 1:5), num_range("ug.Total.C.per.g.dry.soil_WS_1y_", 1:5)))
+#create dataframe for enrichment
+enrichment_ordered <- lipids_ordered %>% select(c(Type, Compound, C, DBE, Marker, num_range("atomperc_MS_2m_", 1:5), num_range("atomperc_MS_1y_", 1:5), num_range("atomperc_WS_2m_", 1:5), num_range("atomperc_WS_1y_", 1:5)))
+
+#row grouping vectors
+#main class
+class1 = intensity_ordered$Type
+class2 = enrichment_ordered$Type
+class = lipids_ordered$Type
+marker = lipids_ordered$Marker
+  
+#heatmap matrices
+mat1 = as.matrix(intensity_ordered[, grep("_", colnames(intensity_ordered))])
+#mean autoscale
+mat1_scaled = prep.autoscale(mat1, center = TRUE, scale = TRUE)
+#mean-scale (by compound)
+mat1_scaledt = t(scale(t(mat1)))
+mat1_scaledt = t(prep.autoscale(t(mat1), center = TRUE, scale = TRUE))
+
+mat2 = as.matrix(enrichment_ordered[, grep("_", colnames(enrichment_ordered))])
+#convert from atom fraction to atom percent
+mat2_perc = mat2
+
+#define row and column orders
+#rownames(mat1_scaled) <- c(1:nrow(mat1_scaled))
+#colnames(mat1_scaled) <- c(1:ncol(mat1_scaled))
+#rownames(mat2_perc) <- c(1:nrow(mat2_perc))
+#colnames(mat2_perc) <- c(1:ncol(mat2_perc))
+
+
+#color functions
+#col_fun1 = circlize::colorRamp2(c(15, 40, 65), hcl_palette = "Blues", reverse = TRUE)
+col_fun1 = circlize::colorRamp2(c(0, 1, 6), c("white","#A6CEE3", "#1F78B4"))
+#col_fun2 = circlize::colorRamp2(c(0, 7.5, 15), hcl_palette = "Reds", reverse = TRUE)
+#col_fun3 <- circlize::colorRamp2(c(0, 10, 30), c("white", "yellow", "red"))
+col_fun4 <- circlize::colorRamp2(c(0, 20), c("black", "red"))
+
+col_fun3 <- circlize::colorRamp2(c(-2, 0, 2), hcl_palette = "Purple-Green")
+hcl.colors(9, palette = "Purple-Green")
+
+muted <- c("#332288" = "Actinos", "#DDCC77" = "Firmicutes", "#117733" = "G-", "#882255" = "Zygomycota", "#44AA99" = "Ascomycota and Basidiomycota", "#999933" = "Unspecified Fungi", "#DDDDDD" = "non-specific")
+
+muted <- c("#332288", "#DDCC77", "#117733", "#882255", "#44AA99", "#999933", "#DDDDDD")
+
+muted_marker <- setNames(muted, levels(marker))
+
+#row annotaiton 
+#ra = rowAnnotation(`#Carbons` = intensity_ordered$`Total Number of Carbon`, `Double Bonds` = intensity_ordered$`Double Bonds`, col = c(list(`#Carbons` = col_fun1), list(`Double Bonds` = col_fun2)),  annotation_name_rot = 45)
+#lipid class
+#mean chain dbe
+ra2 = rowAnnotation(`PLFA class` = anno_block(gp = gpar(fill = c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00", "#FFFF33", "#A65628", "#F781BF"))), Marker = intensity_ordered$Marker, DBE = intensity_ordered$DBE, col = list(DBE = col_fun1, Marker = muted_marker), annotation_name_rot = 45)
+
+hm1 <- Heatmap(mat1_scaledt, 
+        name = "Mean-scaled PLFA Abundance", 
+        #col = viridis::viridis(100),
+        col = col_fun3,
+        #row_order = order(as.numeric(rownames(mat1_scaled))), 
+        #column_order = order(as.numeric(colnames(mat1_scaled))),
+        row_split = class,
+        column_split = factor(c(rep("MI 2 months", 5), rep("MI 1 year", 5), rep("WI 2 months", 5),  rep("WI 1 year", 5)), levels = c("MI 2 months", "MI 1 year", "WI 2 months", "WI  year")),
+        top_annotation = HeatmapAnnotation(empty = anno_empty(border = FALSE), Timepoint = anno_block(gp = gpar(fill = c("#B2DF8A", "#33A02C", "#B2DF8A", "#33A02C")),
+        labels = c("2 months", "1 year", "2 months", "1 year"), 
+        labels_gp = gpar(col = "white", fontsize = 10))),
+        cluster_rows = FALSE, 
+        cluster_columns = FALSE,
+        row_dend_reorder = FALSE,
+        column_dend_reorder = FALSE,
+        cluster_row_slices = FALSE, 
+        show_row_dend = FALSE, 
+        show_column_dend = FALSE,
+        row_title_rot = 0,
+        show_row_names = FALSE,
+        show_column_name = FALSE,
+        left_annotation = ra2,
+        #width = unit(8, "cm"), height = unit(12, "cm"),
+        column_title = "Mean-scaled PLFA abundance"
+        )
+
+viridis_map = circlize::colorRamp2(c(0, 0.5, 1, 2, 3, 4, 5, 7.5, 10, 15), viridis::viridis(10))
+
+hm2 <-  Heatmap(mat2_perc, 
+        name = "PLFA Atm% Enrichment", 
+        col = viridis_map,
+        row_split = class,
+        column_split = factor(c(rep("MI 2 months", 5), rep("MI 1 year", 5), rep("WI 2 months", 5),  rep("WI 1 year", 5)), levels = c("MI 2 months", "MI 1 year", "WI 2 months", "WI  year")),
+        top_annotation = HeatmapAnnotation(empty2 = anno_empty(border = FALSE), Timepoint = anno_block(gp = gpar(fill = c("#B2DF8A", "#33A02C", "#B2DF8A", "#33A02C")),
+        labels = c("2 months", "1 year", "2 months", "1 year"), 
+        labels_gp = gpar(col = "white", fontsize = 10))),
+        cluster_rows = FALSE, 
+        cluster_columns = FALSE,
+        row_dend_reorder = FALSE,
+        column_dend_reorder = FALSE,
+        cluster_row_slices = FALSE, 
+        show_row_dend = FALSE, 
+        show_column_dend = FALSE,
+        show_column_name = FALSE,
+        show_row_names = FALSE,
+        column_title = "PLFA Enrichment (Atom %)"
+        )
+
+ht_list = hm1 + hm2 
+ht = draw(ht_list)
+
+w = ComplexHeatmap:::width(ht)
+w = convertX(w, "inch", valueOnly = TRUE)
+h = ComplexHeatmap:::height(ht)
+h = convertY(h, "inch", valueOnly = TRUE)
+
+library(GetoptLong)  # for the function qq()
+group_block_anno = function(group, empty_anno, gp = gpar(), 
+    label = NULL, label_gp = gpar()) {
+
+    seekViewport(qq("annotation_@{empty_anno}_@{min(group)}"))
+    loc1 = deviceLoc(x = unit(0, "npc"), y = unit(0, "npc"))
+    seekViewport(qq("annotation_@{empty_anno}_@{max(group)}"))
+    loc2 = deviceLoc(x = unit(1, "npc"), y = unit(1, "npc"))
+
+    seekViewport("global")
+    grid.rect(loc1$x, loc1$y, width = loc2$x - loc1$x, height = loc2$y - loc1$y, 
+        just = c("left", "bottom"), gp = gp)
+    if(!is.null(label)) {
+        grid.text(label, x = (loc1$x + loc2$x)*0.5, y = (loc1$y + loc2$y)*0.5, gp = label_gp)
+    }
+}
+group_block_anno2 = function(group, empty_anno, gp = gpar(), 
+    label = NULL, label_gp = gpar()) {
+
+    seekViewport(qq("annotation_empty2_@{min(group)}"))
+    loc1 = deviceLoc(x = unit(0, "npc"), y = unit(0, "npc"))
+    seekViewport(qq("annotation_empty2_@{max(group)}"))
+    loc2 = deviceLoc(x = unit(1, "npc"), y = unit(1, "npc"))
+
+    seekViewport("global")
+    grid.rect(loc1$x, loc1$y, width = loc2$x - loc1$x, height = loc2$y - loc1$y, 
+        just = c("left", "bottom"), gp = gp)
+    if(!is.null(label)) {
+        grid.text(label, x = (loc1$x + loc2$x)*0.5, y = (loc1$y + loc2$y)*0.5, gp = label_gp)
+    }
+}
+
+dev.off()
+pdf("plots/FigureS4.pdf", width = w, height = h)
+ht_list
+group_block_anno(1:2, "empty", gp = gpar(fill = "#1F78B4"), label = "Sandy")
+group_block_anno(3:4, "empty", gp = gpar(fill = "#E31A1C"), label = "Silty")
+group_block_anno2(1:2, "empty", gp = gpar(fill = "#1F78B4"), label = "Sandy")
+group_block_anno2(3:4, "empty", gp = gpar(fill = "#E31A1C"), label = "Silty")
+dev.off()
+```
+

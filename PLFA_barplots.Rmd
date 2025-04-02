@@ -1,0 +1,199 @@
+---
+title: "PLFA barplots"
+author: "Kaitlin Rempfert"
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+output:
+  html_document: 
+    df_print: paged 
+    number_sections: yes 
+    css: stylesheet.css 
+    toc: yes 
+    toc_float: true 
+    toc_depth: 3 
+    code_folding: show 
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, echo = FALSE, message=FALSE, warning=FALSE}
+# load required packages
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+```
+
+
+
+# Import PLFA data
+```{r}
+plfas_w_meta <- readRDS(file = "output/plfas_w_meta.rds")
+```
+
+## Reformat data for plotting
+```{r}
+#convert to nmoles
+plfas_w_meta <- plfas_w_meta %>% mutate(
+  moles.per.g.dry.soil = ug.Total.C.per.g.dry.soil/12*chain_C,
+  moles.13C.excess.per.g.dry.soil = ug.13C.excess.per.g.dry.soil/12*chain_C,
+  excess.atom.fraction = moles.13C.excess.per.g.dry.soil/moles.per.g.dry.soil
+)
+
+#pull out totals
+plfas_total_C <- plfas_w_meta %>% filter(Fraction == "Total") %>% pivot_wider(names_from = Fraction, values_from = ug.Total.C.per.g.dry.soil) %>% select(c(Catalog.Number, Total))
+
+plfa_types_w_meta <- plfas_w_meta %>% na.omit() %>% left_join(., plfas_total_C) %>% mutate(
+  proportion_PLFA_C = ug.Total.C.per.g.dry.soil/Total, 
+  site = as.factor(site), 
+  timepoint = as.factor(timepoint)
+  ) 
+
+plfa_types_w_meta <- plfa_types_w_meta %>% 
+  group_by(Catalog.Number) %>% 
+  mutate(
+total_moles = sum(moles.per.g.dry.soil, na.rm = TRUE)) %>% ungroup() %>%
+  mutate(mol_frac = moles.per.g.dry.soil/total_moles)
+
+plfa_types_summ <- plfa_types_w_meta %>% filter(timepoint == "2month") %>%
+  group_by(Type, Fraction) %>%
+  summarize(avg_wt.perc.excess = mean(wt.perc.13C.excess, na.rm = TRUE), 
+         sd_wt.perc.excess = sd(wt.perc.13C.excess, na.rm = TRUE),
+         avg_prop_C = mean(proportion_PLFA_C, na.rm = TRUE), 
+         sd_prop_C = sd(proportion_PLFA_C, na.rm = TRUE),
+         avg_C = mean(ug.Total.C.per.g.dry.soil, na.rm = TRUE),
+         sd_C = sd(ug.Total.C.per.g.dry.soil, na.rm = TRUE),
+         avg_13C_excess = mean(ug.13C.excess.per.g.dry.soil, na.rm = TRUE),
+         sd_13C_excess = mean(ug.13C.excess.per.g.dry.soil, na.rm = TRUE),
+         avg_moles = mean(moles.per.g.dry.soil, na.rm = TRUE), 
+         sd_moles = sd(moles.per.g.dry.soil, na.rm = TRUE),
+         avg_mol_frac = mean(mol_frac, na.rm = TRUE),
+         sd_mol_frac = sd(mol_frac, na.rm = TRUE),
+         avg_moles_13C_excess = mean(moles.13C.excess.per.g.dry.soil, na.rm = TRUE),
+         sd_moles_13C_excess = sd(moles.13C.excess.per.g.dry.soil, na.rm = TRUE),
+         avg_excess_atom_fraction = mean(excess.atom.fraction, na.rm = TRUE),
+         se_excess_atom_fraction = sqrt((sd_moles_13C_excess^ 2)/(sd_moles^2))
+         ) %>%
+  ungroup() %>% mutate(Type_label = case_when(
+    grepl("Cyclopropyl", Type) ~ "Cyclo",
+    grepl("Hydroxylated", Type) ~ "Hydroxy",
+    grepl("Monounsaturated", Type) ~ "MUFA",
+    grepl("Branched monounsaturated", Type) ~ "brMUFA",
+    grepl("Polyunsaturated", Type) ~ "PUFA",
+    grepl("Saturated with mid-chain", Type) ~ "brSAFA",
+    grepl("Terminally branched saturated", Type) ~  "i/aSAFA",
+    grepl("Straight chained saturated", Type) ~  "SAFA", 
+    TRUE ~ "Other"
+  ), Type_label = factor(Type_label, levels = c("SAFA", "brSAFA", "i/aSAFA", "MUFA", "brMUFA", "PUFA", "Cyclo", "Hydroxy")), 
+  Type = factor(Type, levels = c("Straight chained saturated", "Saturated with mid-chain", "Terminally branched saturated", "Monounsaturated", "Branched monounsaturated", "Polyunsaturated", "Cyclopropyl", "Hydroxylated"))) %>% na.omit()
+```
+
+
+## Plotting
+```{r}
+#Proportion PLFA C, by type
+t1 <- plfa_types_summ %>% group_by(Type, Type_label) %>% summarize(type_prop = sum(avg_prop_C, na.rm = TRUE), type_sd = sum(sd_prop_C, na.rm = TRUE))  %>% mutate(upper_ci = type_prop + type_sd, lower_ci = type_prop - type_sd) %>% ggbarplot("Type_label", "type_prop", fill = "Type", add = "sd_prop", sort.val = "desc", sort.by.groups = TRUE, xlab = "PLFA", ylab = "Proportion PLFA C", palette = "Set1", legend.title = "")
+t1 + rotate_x_text() + 
+  geom_errorbar(aes(group = Type, ymax = upper_ci, ymin = lower_ci),
+                position = position_dodge(width = 0.8), width = 0.25)
+
+#Mole fraction PLFA C, by type
+t1.5 <- plfa_types_summ %>% group_by(Type, Type_label) %>% summarize(type_frac = sum(avg_mol_frac, na.rm = TRUE), type_sd = sum(sd_mol_frac, na.rm = TRUE))  %>% mutate(upper_ci = type_frac + type_sd, lower_ci = type_frac - type_sd) %>% ggbarplot("Type_label", "type_frac", fill = "Type", add = "sd_prop", sort.val = "desc", sort.by.groups = TRUE, xlab = "PLFA", ylab = "Mole Fraction PLFA", palette = "Set1", legend.title = "")
+t1.5 + rotate_x_text() + 
+  geom_errorbar(aes(group = Type, ymax = upper_ci, ymin = lower_ci),
+                position = position_dodge(width = 0.8), width = 0.25)
+
+#Proportion PLFA C, all compounds 
+t2 <- plfa_types_summ %>% mutate(upper_ci = avg_prop_C + sd_prop_C, lower_ci = avg_prop_C - sd_prop_C) %>% group_by(Type, Type_label) %>% ggbarplot("Fraction", "avg_prop_C", fill = "Type", sort.val = "desc", sort.by.groups = TRUE, xlab = "PLFA", ylab = "Proportion PLFA C", palette = "Set1", legend.title = "")
+t2 + rotate_x_text() +
+  geom_errorbar(aes(group = Type, ymax = upper_ci, ymin = lower_ci),
+                position = position_dodge(width = 0.8), width = 0.25)
+
+plfa_types_summ_ordered <- plfa_types_summ %>% group_by(Type) %>% arrange(desc(avg_prop_C), .by_group=T) 
+plfa_types_summ_ordered$Fraction <- fct_inorder(plfa_types_summ_ordered$Fraction)
+
+#13C excess wt%, average
+t3 <- plfa_types_summ %>% group_by(Type, Type_label) %>% summarize(type_excess = mean(avg_wt.perc.excess, na.rm = TRUE), type_sd = sum(sd_wt.perc.excess, na.rm = TRUE)) %>% mutate(upper_ci = type_excess + type_sd, lower_ci = type_excess - type_sd) %>% ggbarplot("Type_label", "type_excess", fill = "Type", sort.val = "desc", sort.by.groups = TRUE, xlab = "PLFA", ylab = "13C excess (wt %)", palette = "Set1", legend.title = "")
+t3 + rotate_x_text() + 
+  geom_errorbar(aes(group = Type, ymax = upper_ci, ymin = lower_ci),
+                position = position_dodge(width = 0.8), width = 0.25)
+
+#13C excess wt%, all compounds 
+t4 <- plfa_types_summ %>% mutate(upper_ci = avg_wt.perc.excess + sd_wt.perc.excess, lower_ci = avg_wt.perc.excess - sd_wt.perc.excess) %>% group_by(Type, Type_label) %>% ggbarplot("Fraction", "avg_wt.perc.excess", fill = "Type", sort.val = "desc", sort.by.groups = TRUE, xlab = "PLFA", ylab = "Excess 13C (wt %)", palette = "Set1", legend.title = "")
+t4 + rotate_x_text() + rremove("legend") +
+  geom_errorbar(aes(group = Type, ymax = upper_ci, ymin = lower_ci),
+                position = position_dodge(width = 0.8), width = 0.25)
+
+#13C excess wt%, all compounds, ordered by abundance 
+t5 <- plfa_types_summ_ordered  %>% mutate(upper_ci = avg_wt.perc.excess + sd_wt.perc.excess, lower_ci = avg_wt.perc.excess - sd_wt.perc.excess) %>% group_by(Type, Type_label) %>% ggbarplot("Fraction", "avg_wt.perc.excess", fill = "Type", sort.by.groups = TRUE, xlab = "PLFA", ylab = "Excess 13C (wt %)", palette = "Set1", legend.title = "")
+t5 + rotate_x_text() +
+  geom_errorbar(aes(group = Type, ymax = upper_ci, ymin = lower_ci),
+                position = position_dodge(width = 0.8), width = 0.25)
+
+#EAF, all compounds 
+plfa_types_w_meta_labels <- plfa_types_w_meta %>% mutate(Type_label = case_when(
+    grepl("Cyclopropyl", Type) ~ "Cyclo",
+    grepl("Hydroxylated", Type) ~ "Hydroxy",
+    grepl("Monounsaturated", Type) ~ "MUFA",
+    grepl("Branched monounsaturated", Type) ~ "brMUFA",
+    grepl("Polyunsaturated", Type) ~ "PUFA",
+    grepl("Saturated with mid-chain", Type) ~ "brSAFA",
+    grepl("Terminally branched saturated", Type) ~  "i/aSAFA",
+    grepl("Straight chained saturated", Type) ~  "SAFA", 
+    TRUE ~ "Other"
+  ), Type_label = factor(Type_label, levels = c("SAFA", "brSAFA", "i/aSAFA", "MUFA", "brMUFA", "PUFA", "Cyclo", "Hydroxy")), 
+  Type = factor(Type, levels = c("Straight chained saturated", "Saturated with mid-chain", "Terminally branched saturated", "Monounsaturated", "Branched monounsaturated", "Polyunsaturated", "Cyclopropyl", "Hydroxylated")))
+  
+t6 <- plfa_types_w_meta_labels %>% filter(timepoint == "2month") %>% ggbarplot(x = "Fraction", y = "excess.atom.fraction", fill = "Type", xlab = "PLFA", ylab = "EAF", palette = "Set1", sort.val = "desc", sort.by.groups = TRUE, add = "mean_se")
+t6 + rotate_x_text() + labs(x = "PLFA", y = expression("Excess Atom Fraction "*{}^13*"C"))
+
+t7 <- plfa_types_w_meta_labels %>% filter(timepoint == "2month") %>% ggbarplot(x = "Type", y = "excess.atom.fraction", fill = "Type", xlab = "PLFA", ylab = "EAF", palette = "Set1", add = "mean_se")
+t7 + rotate_x_text() + labs(x = "PLFA", y = expression("Excess Atom Fraction "*{}^13*"C"))
+
+
+# pairwise comparisons
+pwc1 <- plfa_types_w_meta_labels %>% mutate(wid = paste0(Fraction, "_", block)) %>%
+  #filter(site == "Michigan") %>%
+  group_by(Type) %>%
+  pairwise_t_test(
+    ug.Total.C.per.g.dry.soil ~ timepoint, paired = FALSE,
+    p.adjust.method = "bonferroni"
+    )
+```
+
+## ANOVA + TUKEY
+```{r}
+library(rstatix)
+
+#wt % 13C excess
+#bulk
+aov_wt.perc.13C.excess <- plfa_types_w_meta %>% anova_test(wt.perc.13C.excess ~ timepoint*site)
+tukey_wt.perc.13C.excess <- plfa_types_w_meta %>% tukey_hsd(wt.perc.13C.excess ~ timepoint*site)
+#by type
+aov_type_wt.perc.13C.excess <- plfa_types_w_meta %>% group_by(Type) %>% anova_test(wt.perc.13C.excess ~ timepoint*site)
+tukey_type_wt.perc.13C.excess <- plfa_types_w_meta %>% group_by(Type) %>% tukey_hsd(wt.perc.13C.excess ~ timepoint*site)
+#by microbial group 
+aov_mg_wt.perc.13C.excess <- plfa_types_w_meta %>% group_by(Marker) %>% anova_test(wt.perc.13C.excess ~ timepoint*site)
+tukey_mg_wt.perc.13C.excess <- plfa_types_w_meta %>% group_by(Marker) %>% tukey_hsd(wt.perc.13C.excess ~ timepoint*site)
+
+#ug C
+#bulk
+aov_C <- plfa_types_w_meta %>% anova_test(ug.Total.C.per.g.dry.soil ~ timepoint*site)
+tukey_C <- plfa_types_w_meta %>% tukey_hsd(ug.Total.C.per.g.dry.soil ~ timepoint*site)
+#by type
+aov_type_C <- plfa_types_w_meta %>% group_by(Type) %>% anova_test(ug.Total.C.per.g.dry.soil ~ timepoint*site)
+tukey_type_C <- plfa_types_w_meta %>% group_by(Type) %>% tukey_hsd(ug.Total.C.per.g.dry.soil ~ timepoint*site)
+#by microbial group 
+aov_mg_C <- plfa_types_w_meta %>% group_by(Marker) %>% anova_test(ug.Total.C.per.g.dry.soil ~ timepoint*site)
+tukey_mg_C <- plfa_types_w_meta %>% group_by(Marker) %>% tukey_hsd(ug.Total.C.per.g.dry.soil ~ timepoint*site)
+
+#ug 13C excess
+#bulk
+aov_13C_excess <- plfa_types_w_meta %>% anova_test(ug.13C.excess.per.g.dry.soil ~ timepoint*site)
+tukey_C <- plfa_types_w_meta %>% tukey_hsd(ug.13C.excess.per.g.dry.soil ~ timepoint*site)
+#by type
+aov_type_13C_excess <- plfa_types_w_meta %>% group_by(Type) %>% anova_test(ug.13C.excess.per.g.dry.soil ~ timepoint*site)
+tukey_type_13C_excess <- plfa_types_w_meta %>% group_by(Type) %>% tukey_hsd(ug.13C.excess.per.g.dry.soil ~ timepoint*site)
+#by microbial group 
+aov_mg_13C_excess <- plfa_types_w_meta %>% group_by(Marker) %>% anova_test(ug.13C.excess.per.g.dry.soil ~ timepoint*site)
+tukey_mg_13C_excess <- plfa_types_w_meta %>% group_by(Marker) %>% tukey_hsd(ug.13C.excess.per.g.dry.soil ~ timepoint*site)
+```
+

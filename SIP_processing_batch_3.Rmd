@@ -1,0 +1,3131 @@
+
+---
+title: "13C Glucose Soil Incubation SIP-Lipidomics Data Processing: Batch 3"
+author: "Kaitlin Rempfert"
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+output:
+  html_document: 
+    df_print: paged 
+    number_sections: yes 
+    css: stylesheet.css 
+    toc: yes 
+    toc_float: true 
+    toc_depth: 3 
+    code_folding: show 
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, echo = FALSE, message=FALSE, warning=FALSE}
+# load required packages
+library(tidyverse)
+library(ggplot2)
+library(stringi)
+library(xcms)
+library(IsoCorrectoR)
+library(rstatix)
+library(ggpubr)
+
+#import scripts here
+source(file.path("scripts", "XIC.R"))
+source(file.path("scripts", "cPIE.R"))
+source(file.path("scripts", "html.R"))
+source(file.path("scripts", "multicore.R"))
+source(file.path("scripts", "output.R"))
+source(file.path("scripts", "prep_lipid_files.R"))
+source(file.path("scripts", "proportions_KRR.R"))
+source(file.path("scripts", "proportions2_KRR.R"))
+source(file.path("scripts", "run.R"))
+source(file.path("scripts", "significant_paired_bxplt.R"))
+```
+
+
+## Use output from LIQUID to create a database of lipids to target for EIC extraction of Batch 3 samples
+
+### Import LIQUID output and experimental metadata
+```{r warning=FALSE, eval = TRUE}
+#import metadata file 
+meta <- readxl::read_excel("data/incubation_metadata_w_qc.xlsx")
+
+#import LIQUID output 
+  #path to file for batch 3 data
+  LIQUID_batch3 <- "data/LIQUID_output/Set02_EC5_LIQUID_output_POS.xlsx"
+  #get names of tabs to import
+  tab_names <- readxl::excel_sheets(path = LIQUID_batch3)
+  #filter out "Set2" sample that was already run in batch 2
+  tab_names_pos <- tab_names %>% .[!grepl("Set2", .)]
+  #read data for all tabs
+  list_all <- lapply(tab_names_pos, function(x) readxl::read_excel(path = LIQUID_batch3, sheet = x))
+  #add sheetnames
+  names(list_all) <- tab_names_pos
+  #make dataframe
+  LIQUID_batch3 <- plyr::ldply(list_all, data.frame)
+```
+
+### Average retention times for identified lipids, remove isomers that are within 30 seconds 
+```{r}
+#average retention times for each compound name 
+LIQUID_batch3_RT <- LIQUID_batch3 %>% select(c(Common.Name, Exact.m.z, Formula, Apex.RT, Intensity)) %>% mutate(Exact.m.z = round(as.numeric(Exact.m.z), 3)) %>% group_by(Common.Name, Exact.m.z, Formula) %>% summarise(Average.Apex.RT = mean(Apex.RT), Average.Intensity = mean(Intensity))
+#remove duplicates of compounds that are isomers within 30 seconds RT (choose highest intensity isomer); these isomers will be extracted within same EIC window
+LIQUID_batch3_RT_dupremov <- LIQUID_batch3_RT %>% ungroup() %>% group_by(Formula) %>% mutate(count = n(), RT_span = ifelse(count > 1, max(Average.Apex.RT)- min(Average.Apex.RT), NA)) %>% filter(count <= 1 | RT_span > 0.25 | Average.Intensity == max(Average.Intensity))
+
+#manually remove isomers for compounds that have two isomers more than 30 seconds apart
+to_remove <- c("PC(18:1/18:1)_A", "PC(18:1/18:1)_B", "PC(18:1/18:1)_C", "PC(18:1/19:1)_A", "PC(18:1/19:1)_B", "PC(18:1/19:1)_C", "PC(17:1/18:1)", "DG(16:0/17:0/0:0)", "Cer(d18:0/16:0)", "TG(46:3)", "TG(56:5)", "TG(16:1/16:1/18:1)", "TG(16:0/16:1/18:2)", "TG(16:0/16:0/18:3);TG(16:0/16:1/18:2)", "TG(60:5)",  "TG(18:3/18:3/18:3)", "TG(14:0/20:4/20:4)", "TG(16:1/18:1/20:5)", "TG(54:7)", "TG(18:2/18:2/18:2)", "TG(18:1/18:2/18:3)", "TG(18:1/18:2/18:2)", "TG(16:1/20:4/20:5)", "TG(16:1/20:4/20:4)", "TG(18:1/18:3/20:5)")
+
+LIQUID_batch3_RT_dupremov_man <- LIQUID_batch3_RT_dupremov %>% filter(!Common.Name %in% to_remove)
+
+#manually edit compounds that have isomer names despite removed isomers
+LIQUID_batch3_RT_dupremov_man <- LIQUID_batch3_RT_dupremov_man %>% mutate(Common.Name = case_when(
+  grepl("PC(0:0/18:1)_A", Common.Name, fixed=TRUE) ~ "PC(0:0/18:1)",
+  grepl("DG(16:0/18:2/0:0)", Common.Name, fixed=TRUE) ~ "DG(16:0/18:2/0:0);DG(16:1/18:1/0:0)",
+  grepl("Cer(d20:0/18:0)_A", Common.Name, fixed=TRUE) ~ "Cer(d20:0/18:0)",
+  grepl("DGTSA(16:0/16:1)_A", Common.Name, fixed=TRUE) ~ "DGTSA(16:0/16:1)",
+  grepl("TG(15:1/16:1/16:1)_A", Common.Name, fixed=TRUE) ~ "TG(15:1/16:1/16:1)",
+  grepl("TG(12:0/16:1/16:1)", Common.Name, fixed=TRUE) ~ "TG(12:0/16:1/16:1);TG(14:0/14:1/16:1)",
+  grepl("TG(14:0/16:1/16:1)", Common.Name, fixed=TRUE) ~ "TG(14:0/16:1/16:1);TG(14:1/16:0/16:1)",
+  grepl("TG(14:0/16:0/16:1)", Common.Name, fixed=TRUE) ~ "TG(14:0/16:0/16:1);TG(15:0/15:0/16:1)",
+  grepl("PC(18:2/20:4)", Common.Name, fixed=TRUE) ~ "PC(18:2/20:4);PC(18:1/20:5)",
+  grepl("TG(16:0/16:1/16:1)", Common.Name, fixed=TRUE) ~ "TG(16:0/16:1/16:1);TG(14:0/16:1/18:1)",
+  grepl("TG(16:0/16:0/16:1)", Common.Name, fixed=TRUE) ~ "TG(16:0/16:0/16:1);TG(14:0/16:0/18:1)",
+  grepl("TG(49:0)", Common.Name, fixed=TRUE) ~ "TG(15:0/17:0/17:0);TG(16:0/16:0/17:0)",
+  grepl("TG(16:0/16:1/18:3)", Common.Name, fixed=TRUE) ~ "TG(16:0/16:1/18:3);TG(16:1/16:1/18:2)",
+  grepl("TG(16:1/16:1/18:1);TG(16:0/16:1/18:2)", Common.Name, fixed=TRUE) ~ "TG(16:0/16:0/18:3);TG(16:1/16:1/18:1);TG(16:0/16:1/18:2)",
+  grepl("TG(16:0/16:1/18:1)", Common.Name, fixed=TRUE) ~ "TG(16:0/16:0/18:2);TG(16:0/16:1/18:1)",
+  grepl("TG(51:2)", Common.Name, fixed=TRUE) ~ "TG(15:0/18:1/18:1);TG(16:0/17:1/18:1)",
+  grepl("TG(16:1/16:1/20:4)", Common.Name, fixed=TRUE) ~ "TG(16:1/16:1/20:4);TG(16:1/16:1/20:4)",
+  grepl("TG(16:1/18:2/18:2)", Common.Name, fixed=TRUE) ~ "TG(16:1/18:2/18:2);TG(16:0/16:1/20:4)",
+  grepl("TG(16:0/18:1/18:3);TG(16:0/18:2/18:2)", Common.Name, fixed=TRUE) ~ "TG(16:0/18:1/18:3);TG(16:0/18:2/18:2);TG(16:1/18:1/18:2)",
+  grepl("TG(17:0/18:2/18:3)", Common.Name, fixed=TRUE) ~ "TG(17:0/18:2/18:3);TG(17:2/18:1/18:2);TG(17:1/18:2/18:2)",
+  grepl("TG(53:2)", Common.Name, fixed=TRUE) ~ "TG(16:1/18:1/19:0)",
+  grepl("TG(16:0/18:3/20:5)", Common.Name, fixed=TRUE) ~ "TG(14:0/20:4/20:4);TG(16:0/18:3/20:5)",
+  grepl("TG(16:0/18:2/20:5)", Common.Name, fixed=TRUE) ~ "TG(16:0/18:2/20:5);TG(16:1/18:1/20:5)",
+  grepl("TG(18:0/18:2/18:2)", Common.Name, fixed=TRUE) ~ "TG(18:0/18:2/18:2);TG(18:1/18:1/18:2)",
+  grepl("TG(18:0/18:0/18:2)", Common.Name, fixed=TRUE) ~ "TG(18:0/18:0/18:2);TG(18:0/18:1/18:1);TG(16:0/18:1/20:1)",
+  grepl("TG(17:0/18:1/19:0);TG(16:1/19:0/19:0)", Common.Name, fixed=TRUE) ~ "TG(17:0/18:1/19:0);TG(16:1/19:0/19:0);TG(18:0/18:0/18:1);TG(16:0/18:1/20:0)",
+  grepl("TG(16:0/20:5/20:5)", Common.Name, fixed=TRUE) ~ "TG(16:0/20:5/20:5);TG(16:1/20:4/20:5)",
+  grepl("TG(16:0/20:4/20:5)", Common.Name, fixed=TRUE) ~ "TG(16:0/20:4/20:5);TG(16:1/20:4/20:4)",
+  grepl("TG(18:2/18:2/20:5)", Common.Name, fixed=TRUE) ~ "TG(18:2/18:2/20:5);TG(18:1/18:3/20:5)",
+  grepl("TG(18:3/18:3/20:1)", Common.Name, fixed=TRUE) ~ "TG(18:1/18:2/20:4);TG(18:1/18:1/20:5);TG(18:3/18:3/20:1)",
+  grepl("TG(18:2/18:3/20:1)", Common.Name, fixed=TRUE) ~ "TG(18:2/18:3/20:1);TG(18:2/18:2/20:2);TG(18:2/18:3/20:1)",
+  grepl("TG(18:1/18:2/20:1)", Common.Name, fixed=TRUE) ~ "TG(18:1/18:1/20:2);TG(18:1/18:2/20:1);TG(18:2/18:2/20:0);TG(18:1/18:3/20:0)",
+  grepl("TG(17:0/20:4/20:5)", Common.Name, fixed=TRUE) ~ "TG(17:0/20:4/20:5);TG(17:1/20:4/20:4)",
+  grepl("TG(56:2)", Common.Name, fixed=TRUE) ~ "TG(18:1/18:1/20:0)",
+  grepl("TG(16:0/18:1/22:0)", Common.Name, fixed=TRUE) ~ "TG(16:0/18:1/22:0);TG(18:1/19:0/19:0)",
+  grepl("TG(18:2/20:4/20:5)", Common.Name, fixed=TRUE) ~ "TG(18:2/20:4/20:5);TG(18:1/20:5/20:5)",
+  grepl("TG(18:2/20:4/20:4)", Common.Name, fixed=TRUE) ~ "TG(18:2/20:4/20:4);TG(18:1/20:4/20:5)",
+  grepl("TG(18:2/18:2/22:1)", Common.Name, fixed=TRUE) ~ "TG(18:2/18:2/22:1);TG(18:1/18:3/22:1);TG(18:1/20:1/20:3)",
+  grepl("TG(18:2/20:1/20:1)", Common.Name, fixed=TRUE) ~ "TG(18:2/20:1/20:1);TG(18:2/18:2/22:0)",
+  grepl("TG(60:13)", Common.Name, fixed=TRUE) ~ "TG(20:4/20:4/20:5)",
+  grepl("TG(18:2/18:2/24:0)", Common.Name, fixed=TRUE) ~ "TG(18:2/18:2/24:0);TG(18:1/18:2/24:1)",
+  TRUE ~ Common.Name
+))
+
+```
+
+### Use identified lipids to create a database of compounds with formulas and random identifier string
+```{r}
+#create database with compounds and chemical formulas
+batch3_db <- LIQUID_batch3_RT_dupremov_man %>% select(-c(count, Average.Intensity)) %>% dplyr::rename(compound = Common.Name, mz_db = Exact.m.z, rt_db = Average.Apex.RT) %>% mutate(rt_window = 30) %>% ungroup()
+batch3_db <- batch3_db %>% select(c(compound, Formula, mz_db)) %>% 
+  #string split the chemical formulas
+  mutate(
+    name=str_extract_all(Formula,"[A-Za-z]+"),
+    value=str_extract_all(Formula,"\\d+")
+    ) %>%
+   unnest() %>% spread(name,value = value, fill=0) %>% mutate(S = 0)
+#add random string as Identifier 
+batch3_db$Identifier <- stringi::stri_rand_strings(length(unique(batch3_db$compound)), 5, pattern = "[a-z]")
+```
+
+
+# Wisconsin Switchgrass, 2 month
+
+## Prepare input files for extraction of MIDs of identified lipids using ProteinTurnover 
+
+### Create vectors of sample names, file extensions, and catalog numbers from metadata
+```{r}
+#filter metadata to just batch 3
+meta_samp <- meta %>% filter(batch == "3" & polarity == "positive") %>% filter(site == "Wisconsin" & crop == "Switchgrass" & timepoint == "2Month")
+
+#add columns to metadata
+meta_samp <- meta_samp %>% mutate(
+  #create label of labeled/unlabeled and rep (block)
+  label_group = ifelse(amendment == "13C_Gluc", "L", "U"),
+  label_group = paste0(label_group, block), 
+  #add .rds file extension
+  sample_name_rds = reader::rmv.ext(sample_name, only.known = FALSE), 
+  sample_name_rds = paste0(sample_name_rds, ".rds")
+)
+
+#create vectors of sample names, mzXML file extensions, rds file extensions, and catalog numbers
+sample <- meta_samp$label_group
+mzXML <- meta_samp$sample_name
+rds <- meta_samp$sample_name_rds 
+sample_filt <- meta_samp$catalog_number
+```
+
+### Import raw .mzXML files and execute peak-picking 
+```{r}
+#path to .mzXML files
+dda_folder = "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Switchgrass_2month"
+#list all files inside specified folder
+mzXMLfiles_dda <- list.files(dda_folder, recursive = TRUE, full.names = TRUE, pattern = "\\.mzXML$")
+#create dataframe witg file extensions and sample names
+pd_samp <- data.frame(extension = mzXMLfiles_dda, sample_name = basename(mzXMLfiles_dda))
+#merge metadata with phenodata frame 
+pd_samp <- left_join(meta_samp, pd_samp, by = "sample_name")
+#export ordered file list
+samps <- as.vector(pd_samp$extension)
+
+#load data 
+dda_data <- readMSData(samps,  pdata = new("NAnnotatedDataFrame", pd_samp), centroided = TRUE, mode = "onDisk")
+
+#set peak-picking parameters
+cwp <- CentWaveParam(A = 4.289723e-07, ppm=1, Instrument=2, peakwidth=c(2.5, 45), snthresh = 10, noise=10000, prefilter=c(3, 100000), firstBaselineCheck = FALSE, integrate=2)
+
+#pick peaks
+dda_data_peaks <- findChromPeaks(dda_data, param = cwp)
+```
+
+### Plot up monoisotopic XICs for targets and manually adjust (if needed) the RT window for peak RT and intensity extraction
+```{r}
+#create target list for XIC plots 
+rt_targets <- LIQUID_batch3_RT_dupremov_man %>% select(-c(count, Average.Intensity)) %>% dplyr::rename(compound = Common.Name, mz_db = Exact.m.z, rt_db = Average.Apex.RT) %>% mutate(rt_window = 30) %>% ungroup()
+
+#plot
+raw_XIC_plot(rt_targets, dda_data_peaks)
+
+#manual adjustments to target list before apex RT and intensity extraction
+rt_targets_2 <- rt_targets %>% mutate(
+  #adjust rt_window for compounds manually for messy EICs
+  rt_window = case_when(
+    grepl("TG(18:1/20:3/20:4)", compound, fixed=TRUE) ~ 15,
+    grepl("TG(18:1/20:1/20:4)", compound, fixed=TRUE) ~ 15,
+    grepl("Cer(d20:0/16:0)", compound, fixed=TRUE) ~ 15,
+    TRUE ~ rt_window
+  )
+)
+```
+
+
+### Peak apex RT and intensity extraction
+```{r}
+#extract peak intensity and retention time
+peak_param <- extract_peak_param(rt_targets_2, dda_data_peaks)
+
+#convert intensity and retention time columns to class numeric for filtering
+peak_param <- peak_param %>% ungroup() %>% mutate(Intensity = as.numeric(as.character(Intensity)), RT = as.numeric(as.character(RT)), RT_width = as.numeric(as.character(RT_width)), compound = as.character(compound))
+#except for FA that vary significantly in RT, average RT; average RT_width for all
+peak_param_avg <- peak_param %>% group_by(compound) %>% mutate(
+  RT = case_when(
+    grepl("FA", compound) ~ RT,
+    grepl("Cer", compound) ~ RT,
+    TRUE ~ mean(RT, na.rm = TRUE)
+    ), 
+  RT_width = mean(RT_width, na.rm = TRUE)
+)
+```
+
+### Make ProteinTurnover target file with rt.tol from extract_peak_param
+```{r}
+#from metadata, select label_group (sample names) and catalog numbers
+sample_meta <- meta_samp %>% select(catalog_number, label_group, block)
+#from batch2_db, select compound, Identifier, # of C
+compound_meta <- batch3_db %>% select(compound, C, Identifier, mz_db)
+#join meta with peak_apex df to create target df
+compound_targets <- peak_param_avg %>% left_join(compound_meta)  %>% left_join(sample_meta) %>% 
+  #add rt.tol, mz.tol, nchannels, Z columns
+mutate(
+  rt.tol = RT_width/2.5,
+  mz.tol = 0.0075,
+  C = as.numeric(C),
+  nchannels = round((.2 * C + 1), 0),
+  Z = 1,
+  ) %>% dplyr::rename(Compound = compound, MZ = mz_db, Sample = label_group) %>% 
+  #filter out intensity < 300000
+  filter(Intensity > 300000) %>% 
+  add_count(Compound, block) %>%
+ #filter to only include paired labeled and unlabeled blocks; filter to at least 3 pairs per treatment 
+  filter(n==2) %>% add_count(Compound, amendment) %>% filter(nn > 2) %>% select(-c(C, catalog_number, Intensity, RT_width, amendment, block, n, nn))
+
+#write to .csv
+write.csv(compound_targets, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Switchgrass_2month/targets.csv")
+```
+
+### Make Molecule File for IsoCorrectoR
+```{r}
+#make molecules file (will need to subset later)
+molecules_presubset <- batch3_db %>% select(c(Identifier, Formula, C)) %>% dplyr::rename(Molecule = Identifier) %>% mutate(Formula = paste0(Formula, "LabC", C)) %>% select(Molecule, Formula)
+
+#make key for molecules file
+key <- batch3_db %>% select(Identifier, compound)
+```
+
+### Make Element File for IsoCorrectoR
+```{r}
+elements <- batch3_db %>% select(c(C, H, N, O, S, P, Identifier)) %>% dplyr::rename(Code = Identifier)
+
+write.csv(elements, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Switchgrass_2month/elementTable.csv")
+```
+
+
+## Use ProteinTurnover to extract MIDs for lipids 
+
+### Set up list of parameters for extracting isotopic XIC 
+```{r}
+t <- list()
+
+#Set the number of cores to use. 
+t$num.cores <- 1
+
+#set data directory
+t$dir.data <- "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Switchgrass_2month" 
+
+#set results directory
+t$dir.results <-  "output/pos/Wisconsin_Switchgrass_2month_PT" 
+
+#set target file
+t$targetfile <- "targets.csv" 
+
+#set sample names, names of mzXML files, and names of .rds files
+t$samples <- sample
+t$rawfiles <- mzXML 
+t$rdsfiles <- rds
+
+#set isotope
+t$isotope <- "C"
+
+#Set parameter to get the relative abundance from EIC (relAbForTimes).Available options are ("lm", "rlm", "lqs", "rq", "sum","log")
+
+t$regression.model <- "lm"   # "lm" as linear regression
+```
+
+### Convert raw mzXML files to Rdata files
+This only need be done once.
+This speeds up the steps below; it can be skipped if the raw files are used in addEICs.
+```{r}
+rawToRDS(t$dir.data, t$rawfiles, t$rdsfiles)
+```
+
+### Get EICs and calculate relative abundances of isotopologues using ProteinTurnover
+```{r}
+#Read the target file.
+dat2 <- readTargetFile(t$targetfile, samples=t$samples, dir=t$dir.data)
+# Prepare the data structure for each target compound
+elementTable <- read.csv("/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Switchgrass_2month/elementTable.csv")
+
+targets <- prepTargets(dat2,
+                      isotope=t$isotope)
+# Get the EIC data for each target.
+targets <- addEICs_KRR(targets, files=t$rdsfiles, type="rds", samples=t$samples, dir=t$dir.data)
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eicdata.Rdata"))
+
+# Calculate relative abundances of each isotopic channel
+targets <- mclapply.progress(targets, function(target) {
+  relAb <- makeRelAb(target, regression.model=t$regression.model)
+  list(target=target, relAb=relAb)    
+  })
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eic_rel.Rdata"))
+```
+
+### Filter ProteinTurnover Results + Create Final Target File
+```{r}
+#Extract regression and relative abundance data from ProteinTurnover results
+out <- getResults(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "relAb", "relAb.obs", "relAb.se", "relAb.Rsq", "proportion", "compound")) 
+#order columns
+out <- out[, col_order]
+#relabel
+out_relab <- out %>% mutate(Identifier = compound, compound = NULL)
+
+#quality control filtering of relative abundance regressions
+out_relab_filter <- out_relab %>% group_by(Identifier) %>%
+#to check for coelution, make sure the relative abundance of higher isotopic channels in unlabeled samples is lower than the relative abundance of the first isotopic channel
+mutate(higher_iso_max_prop = case_when(grepl("U", Sample) & channel > 1 ~ proportion, 
+                                            TRUE ~ 0),
+       higher_iso_max_prop = max(higher_iso_max_prop),
+       lower_iso_max_prop = case_when(grepl("U", Sample) & channel <= 1 ~ proportion, 
+                                   TRUE ~ 0),
+       lower_iso_max_prop = max(lower_iso_max_prop)) %>% filter(lower_iso_max_prop * 1.1 > higher_iso_max_prop) %>% group_by(Identifier, Sample) %>%
+#r-squared of regression > 0.7
+filter(relAb.Rsq >= 0.7) %>% group_by(Identifier) %>% add_count(Sample) %>%
+#require at least 3 isotopic channels (4 channel total)
+filter(n>=4) %>% 
+#for each compound, find the max # of channels that meet r-squared filtering in all samples
+mutate(max_channels = min(n)) %>% group_by(Identifier, Sample) %>% slice(1:max_channels) %>% 
+#require monoisotopic channel to be present
+filter(min(channel) == 0) %>% ungroup()
+
+#Get metrics of relative abundance data 
+metrics <- out_relab_filter %>% ungroup() %>%
+  group_by(Sample, Identifier) %>%
+#calculate min, max, mean, and weighted mean of the relative abundance standard error and R-squared
+  dplyr::summarise(Num_channels = n(), #Scans_per_channel = max(obs), 
+                   min.relAb.se = min(relAb.se, na.rm = TRUE), 
+                   max.relAb.se = max(relAb.se, na.rm = TRUE), 
+                   mean.relAb.se = mean(relAb.se, na.rm = TRUE), 
+                   min.relAb.Rsq = min(relAb.Rsq, na.rm = TRUE), 
+                   max.relAb.Rsq = max(relAb.Rsq, na.rm = TRUE), 
+                   mean.relAb.Rsq = mean(relAb.Rsq, na.rm = TRUE)) %>%
+  ungroup() %>%
+  as.data.frame(.)
+
+#filter target list to only paired labeled and unlabeled blocks and compounds with at least 3 paired reps
+compound_targets_2 <- left_join(metrics, compound_targets) %>% mutate(Sample_split = Sample, amendment = ifelse(grepl("L", Sample), "13C_Gluc", "NA_Gluc")) %>% separate(Sample_split, sep = 1, c(NA, "block")) %>%
+#filter to only paired labeled and unlabeled samples post regression filtering
+add_count(Identifier, block) %>% filter(n==2) %>% 
+#filter to only compounds with 3 unlabeled and labeled reps
+add_count(Identifier, amendment) %>% filter(nn > 2) %>% ungroup() %>%
+#remove old nchannels column
+select(-nchannels) %>%
+#rename Num_channels to nchannels
+dplyr::rename(nchannels = Num_channels) %>%
+#select necessary columns for target file
+select(c(Compound, RT, Sample, Identifier, MZ, rt.tol, mz.tol, nchannels, Z))
+
+#write to .csv
+write.csv(compound_targets_2, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Switchgrass_2month/targets_2.csv")
+```
+
+### Rerun MID calculations
+```{r}
+#set to new target file
+t$targetfile <- "targets_2.csv" 
+
+#read target file
+dat2 <- readTargetFile(t$targetfile, samples=t$samples, dir=t$dir.data)
+
+elementTable <- read.csv("/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Switchgrass_2month/elementTable.csv")
+
+targets <- prepTargets(dat2,
+                      isotope=t$isotope)
+
+## Get the EIC data for each target.
+targets <- addEICs_KRR(targets, files=t$rdsfiles, type="rds", samples=t$samples, dir=t$dir.data)
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eicdata.Rdata"))
+
+## Calculate relative abundances of each isotopic channel
+targets <- mclapply.progress(targets, function(target) {
+  relAb <- makeRelAb(target, regression.model=t$regression.model)
+  list(target=target, relAb=relAb)    
+  })
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eic_rel.Rdata"))
+
+## HTML outputs 
+#Set up multiple cores
+if(!is.null(t$num.cores)) { options(mc.cores=t$num.cores) } 
+
+#Make html output of EICs and relative abundance regressions
+out <- makeTargetHTML(targets, dir=t$dir.results, file="results-EIC")
+```
+
+
+## Use cPIE functions to generate IsoCorrectoR input files  
+
+### Get isotopologue relative abundance data for each compound from targets object
+```{r}
+#Apply function to get and format data
+out <- getResults(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "relAb", "relAb.obs", "relAb.se", "relAb.Rsq", "proportion", "compound")) 
+#adjust column order
+out <- out[, col_order]
+#format
+out_mod <- out %>%
+  mutate(ID = Sample) %>%
+  mutate(isotopologue = as.integer(channel), area = as.numeric(relAb)) %>%
+  select(compound, isotopologue, ID, area) %>%
+  spread(key = ID, value = area, fill = NA)
+
+#write output to file 
+write.table(out, file = paste("output/pos/Wisconsin_Switchgrass_2month_PT/ProteinTurnover_processed_output_",format(Sys.time(), "%Y-%m-%d"),".txt", sep = ""), quote = FALSE, row.names = FALSE, sep = "\t")
+```
+
+### Extract intensity/count data from targets object 
+```{r}
+## Apply function to get and format count data
+counts <- getCounts(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "RT", "Count", "BaseCount", "use", "compound")) 
+
+counts <- counts[, c("Sample", "compound", "channel", "RT", "Count", "BaseCount", "use")]
+
+#write output to file 
+write.table(counts, file = paste("output/pos/Wisconsin_Switchgrass_2month_PT/ProteinTurnover_counts_",format(Sys.time(), "%Y-%m-%d"),".txt", sep = ""), quote = FALSE, row.names = FALSE, sep = "\t")
+```
+
+### Create "measurement file" for IsoCorrector
+```{r}
+out_mod <- out %>%
+  mutate(ID = Sample) %>%
+  mutate(isotopologue = as.integer(channel), area = as.numeric(relAb)) %>%
+  select(compound, isotopologue, ID, area) %>%
+  spread(key = ID, value = area, fill = NA)
+
+# write output to file
+out_mod %>%
+  unite("Measurements/Samples", compound, isotopologue, sep = "_", remove = TRUE) %>%
+  arrange(desc(UB5)) %>%
+  write.csv(., file = paste("output/pos/Wisconsin_Switchgrass_2month_PT/Wisconsin_Switchgrass_2month_pos_",format(Sys.time(), "%Y-%m-%d"),".csv", sep = ""), quote = FALSE, row.names = FALSE, na = "")
+```
+
+### Subset molecule file for IsoCorrector
+```{r, eval = FALSE}
+molecules_presubset %>%
+  semi_join(., out_mod, by = c("Molecule" = "compound")) %>% mutate(MS = "") %>%
+  setNames(c("Molecule", "MS ion or MS/MS product ion", "MS/MS neutral loss")) %>%
+  write.csv(x = ., file = "output/pos/Wisconsin_Switchgrass_2month_PT/Wisconsin_Switchgrass_2month_pos_molecule_file_subset.csv", quote = FALSE, row.names = FALSE, na = "")
+```
+
+
+## Process data through IsoCorrectoR
+```{r}
+IsoCorrection(MeasurementFile = "output/pos/Wisconsin_Switchgrass_2month_PT/Wisconsin_Switchgrass_2month_pos_2022-04-12.csv", 
+              ElementFile = "data/databases/element_file.csv", 
+              MoleculeFile = "output/pos/Wisconsin_Switchgrass_2month_PT/Wisconsin_Switchgrass_2month_pos_molecule_file_subset.csv",
+              CorrectTracerImpurity = TRUE, CorrectTracerElementCore = TRUE, 
+              CalculateMeanEnrichment = TRUE, UltraHighRes = FALSE, 
+              DirOut = 'output/pos/Wisconsin_Switchgrass_2month_PT', 
+              FileOut = 'result', 
+              FileOutFormat = 'csv', 
+              ReturnResultsObject = TRUE, CorrectAlsoMonoisotopic = FALSE, 
+              CalculationThreshold = 10^-10, 
+              CalculationThreshold_UHR = 8, 
+              verbose = TRUE, Testmode = FALSE)
+```
+
+
+## Combine and post-process cPIE data  
+  
+### Read and calculate spectrum intensity/count data
+```{r}
+# Aggregate various scans (indexed by retention times) to the level of compound*isotopologue (i.e., channel)
+counts_mod <- counts %>%
+  mutate(Identifier = compound, compound = NULL) %>%
+  group_by(Identifier, Sample, channel) %>%
+  dplyr::summarise(obs = n(), Total = sum(Count), check = sum(use), .groups = "keep") %>%
+  ungroup()
+```
+
+### Read in processed relative abundance (ProteinTurnover) output
+```{r PT_import}
+# Relative abundance data stored in object "out"; Use channel-specific metrics like relative abundance R-squared values for quality control.
+out_relab <- out %>% mutate(Identifier = compound, compound = NULL)
+```
+
+### Read in processed IsoCorrectoR data
+```{r isoR_data_in}
+isoR_enrich <- read.csv("output/pos/Wisconsin_Switchgrass_2month_PT/2022-04-12_111331/IsoCorrectoR_result_MeanEnrichment.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+
+isoR_resid <- read.csv("output/pos/Wisconsin_Switchgrass_2month_PT/2022-04-12_111331/IsoCorrectoR_result_Residuals.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+
+isoR_correct <- read.csv("output/pos/Wisconsin_Switchgrass_2month_PT/2022-04-12_111331/IsoCorrectoR_result_Corrected.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+```
+
+### Generate long-format data
+```{r long_exp}
+#Manipulate data into long format
+isoR_enrich_long <- tidyr::pivot_longer(data = isoR_enrich, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "mean.enrichment") %>% dplyr::rename(Identifier = X)
+
+#These contain channel-specific data
+isoR_resid_long <- tidyr::pivot_longer(data = isoR_resid, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "residuals") %>% 
+  dplyr::rename(Identifier = X) %>%
+  mutate(Identifier = as.character(Identifier), residuals.abs = abs(residuals)) %>%
+  separate(col = "Identifier", into = c("Identifier", "channel"), sep = "_", remove = TRUE, convert = TRUE, extra = "warn", fill = "warn")
+
+isoR_correct_long <- tidyr::pivot_longer(data = isoR_correct, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "Cor.relAb") %>%
+  dplyr::rename(Identifier = X) %>%
+  mutate(Identity = as.character(Identifier)) %>%
+  separate(col = "Identifier", into = c("Identifier", "channel"), sep = "_", remove = TRUE, convert = TRUE, extra = "warn", fill = "warn")
+```
+
+### Aggregate channel-level and compound-level data
+```{r}
+## Remember that out_relab and counts_mod contain isotopologue/channel-specific data (no longer scan-specific)
+channel_metrics <- left_join(out_relab, counts_mod, by = c("Identifier", "Sample", "channel")) %>%
+  left_join(., isoR_resid_long, by = c("Identifier", "Sample", "channel")) %>%
+  left_join(., isoR_correct_long, by = c("Identifier", "Sample", "channel"))
+```
+
+### Calculate the mean, weighted mean, max, and min values across all channels for each error metric
+```{r}
+ compound_metrics <- channel_metrics %>%
+  group_by(Sample, Identifier) %>%
+  dplyr::summarise(Num_channels = n(), Scans_per_channel = max(obs), 
+                   Intensity = sum(Total, na.rm = TRUE), 
+                   min.relAb.se = min(relAb.se, na.rm = TRUE), 
+                   max.relAb.se = max(relAb.se, na.rm = TRUE), 
+                   mean.relAb.se = mean(relAb.se, na.rm = TRUE), 
+                   wtmean.relAb.se = weighted.mean(relAb.se, Total, na.rm = TRUE), 
+                   min.relAb.Rsq = min(relAb.Rsq, na.rm = TRUE), 
+                   max.relAb.Rsq = max(relAb.Rsq, na.rm = TRUE), 
+                   mean.relAb.Rsq = mean(relAb.Rsq, na.rm = TRUE), 
+                   wtmean.relAb.Rsq = weighted.mean(relAb.Rsq, Total, na.rm = TRUE),
+                   min.residuals = min(residuals, na.rm = TRUE), 
+                   max.residuals = max(residuals, na.rm = TRUE), 
+                   mean.residuals = mean(residuals, na.rm = TRUE), 
+                   wtmean.residuals = weighted.mean(residuals, Total, na.rm = TRUE),
+                   min.residuals.abs = min(residuals.abs, na.rm = TRUE), 
+                   max.residuals.abs = max(residuals.abs, na.rm = TRUE), 
+                   mean.residuals.abs = mean(residuals.abs, na.rm = TRUE), 
+                   wtmean.residuals.abs = weighted.mean(residuals.abs, Total, na.rm = TRUE), 
+                   Total.Cor.relAb = sum(Cor.relAb, na.rm = TRUE),
+                   Total.Obs.relAb = sum(relAb, na.rm = TRUE), .groups = "keep") %>%
+  ungroup() %>%
+  mutate(TotalResidual = as.numeric(Total.Cor.relAb/Total.Obs.relAb)) %>%
+  mutate(TotalResidual.log = ifelse(TotalResidual == 0, NA, log10(TotalResidual))) %>% ## check for zeroes so don't produce -Inf
+  as.data.frame(.)
+```
+
+### Join compound-aggregated error estimates with mean.enrichment output  
+```{r}
+compounds_metrics_enrich <- isoR_enrich_long %>%
+  left_join(compound_metrics, ., by = c("Identifier", "Sample")) %>%
+#join with key to get compound names
+left_join(key) %>%
+#add column "Label" to indicate labeling treatment (unlabeled vs labeled) and "Rep" with the rep #
+mutate(Sample_category = "Wisconsin_Switchgrass_2month", Label = ifelse(grepl("L", Sample), "labeled", "unlabeled"), Rep = regmatches(Sample, gregexpr("[[:digit:]]+", Sample)), Rep = as.numeric(Rep))
+
+saveRDS(compounds_metrics_enrich, "output/pos/Wisconsin_Switchgrass_2month_PT/compounds_metrics_enrich.RDS")
+```
+
+### Calculate paired rep (labeled vs unlabeled) relative mean enrichment & implement paired t-test with Cohen's D 
+```{r}
+#paired t-test
+t_test <- compounds_metrics_enrich %>% 
+  group_by(Sample_category, Identifier, compound) %>%
+  t_test(mean.enrichment ~ Label, paired = TRUE, detailed = TRUE) %>%
+  add_significance() 
+  
+#calculate effect size (Cohen's D)
+cohens_d <- compounds_metrics_enrich %>% 
+  group_by(Sample_category, Identifier, compound) %>%
+  cohens_d(mean.enrichment ~ Label, paired = TRUE)
+
+#calculate relative enrichment between unlabeled and labeled reps
+rel_enrich <- compounds_metrics_enrich %>%
+  group_by(Sample_category, Identifier, compound, Rep) %>% 
+  pivot_wider(names_from = Label, values_from = mean.enrichment) %>% 
+  summarise(labeled = dplyr::first(na.omit(labeled)),
+      unlabeled = dplyr::first(na.omit(unlabeled))) %>%
+  mutate(rel_enrichment = labeled - unlabeled) %>%
+#calculate mean + sd enrichment difference between unlabeled and labeled rep pairs
+  group_by(Sample_category, Identifier, compound) %>% 
+  summarize(mean_rel_enrichment = mean(rel_enrichment), 
+         sd_rel_enrichment = sd(rel_enrichment))
+
+#combine
+Wisconsin_Switchgrass_2month_pos <- left_join(t_test, cohens_d) %>% left_join(rel_enrich)
+saveRDS(Wisconsin_Switchgrass_2month_pos, "output/pos/Wisconsin_Switchgrass_2month_PT/Wisconsin_Switchgrass_2month_pos.RDS" )
+```
+
+### Pull out putatively enriched compounds (p < 0.05, effsize > 0.5) and plot paired boxplots
+```{r}
+#filter significant p-values and create vector of corresponding identifiers
+significant <- Wisconsin_Switchgrass_2month_pos %>% filter(p < 0.05 & effsize > 0.5)
+significant_vec <- significant$Identifier
+
+#plot paired boxed plots of (significant) putatively enriched compounds
+signif_paired_boxplot(significant_vec, compounds_metrics_enrich, "output/pos/Wisconsin_Switchgrass_2month_PT/pairedboxplots.pdf")
+```
+
+
+## Michigan Switchgrass 2 Month
+
+## Prepare input files for extraction of MIDs of identified lipids using ProteinTurnover 
+
+### Create vectors of sample names, file extensions, and catalog numbers from metadata
+```{r}
+#filter metadata to just batch 2
+meta_samp <- meta %>% filter(batch == "3" & polarity == "positive") %>% filter(site == "Michigan" & crop == "Switchgrass" & timepoint == "2Month")
+
+#add columns to metadata
+meta_samp <- meta_samp %>% mutate(
+  #create label of labeled/unlabeled and rep (block)
+  label_group = ifelse(amendment == "13C_Gluc", "L", "U"),
+  label_group = paste0(label_group, block), 
+  #add .rds file extension
+  sample_name_rds = reader::rmv.ext(sample_name, only.known = FALSE), 
+  sample_name_rds = paste0(sample_name_rds, ".rds")
+)
+
+#create vectors of sample names, mzXML file extensions, rds file extensions, and catalog numbers
+sample <- meta_samp$label_group
+mzXML <- meta_samp$sample_name
+rds <- meta_samp$sample_name_rds 
+sample_filt <- meta_samp$catalog_number
+```
+
+### Import raw .mzXML files and execute peak-picking 
+```{r}
+#path to .mzXML files
+dda_folder = "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Switchgrass_2month"
+#list all files inside specified folder
+mzXMLfiles_dda <- list.files(dda_folder, recursive = TRUE, full.names = TRUE, pattern = "\\.mzXML$")
+#create dataframe witg file extensions and sample names
+pd_samp <- data.frame(extension = mzXMLfiles_dda, sample_name = basename(mzXMLfiles_dda))
+#merge metadata with phenodata frame 
+pd_samp <- left_join(meta_samp, pd_samp, by = "sample_name")
+#export ordered file list
+samps <- as.vector(pd_samp$extension)
+
+#load data 
+dda_data <- readMSData(samps,  pdata = new("NAnnotatedDataFrame", pd_samp), centroided = TRUE, mode = "onDisk")
+
+#set peak-picking parameters
+cwp <- CentWaveParam(A = 4.289723e-07, ppm=1, Instrument=2, peakwidth=c(2.5, 45), snthresh = 10, noise=10000, prefilter=c(3, 100000), firstBaselineCheck = FALSE, integrate=2)
+
+#pick peaks
+dda_data_peaks <- findChromPeaks(dda_data, param = cwp)
+```
+
+### Plot up monoisotopic XICs for targets and manually adjust (if needed) the RT window for peak RT and intensity extraction
+```{r}
+#create target list for XIC plots 
+rt_targets <- LIQUID_batch3_RT_dupremov_man %>% select(-c(count, Average.Intensity)) %>% dplyr::rename(compound = Common.Name, mz_db = Exact.m.z, rt_db = Average.Apex.RT) %>% mutate(rt_window = 30) %>% ungroup()
+
+#plot
+raw_XIC_plot(rt_targets, dda_data_peaks)
+
+#manual adjustments to target list before apex RT and intensity extraction
+rt_targets_2 <- rt_targets %>% mutate(
+  #adjust rt_window for compounds manually for messy EICs
+  rt_window = case_when(
+    grepl("TG(18:1/20:3/20:4)", compound, fixed=TRUE) ~ 15,
+    grepl("TG(18:1/20:1/20:4)", compound, fixed=TRUE) ~ 15,
+    grepl("Cer(d20:0/16:0)", compound, fixed=TRUE) ~ 15,
+    TRUE ~ rt_window
+  )
+)
+```
+
+
+### Peak apex RT and intensity extraction
+```{r}
+#extract peak intensity and retention time
+peak_param <- extract_peak_param(rt_targets_2, dda_data_peaks)
+
+#convert intensity and retention time columns to class numeric for filtering
+peak_param <- peak_param %>% ungroup() %>% mutate(Intensity = as.numeric(as.character(Intensity)), RT = as.numeric(as.character(RT)), RT_width = as.numeric(as.character(RT_width)), compound = as.character(compound))
+#except for FA that vary significantly in RT, average RT; average RT_width for all
+peak_param_avg <- peak_param %>% group_by(compound) %>% mutate(
+  RT = case_when(
+    grepl("FA", compound) ~ RT,
+    TRUE ~ mean(RT, na.rm = TRUE)
+    ), 
+  RT_width = mean(RT_width, na.rm = TRUE)
+)
+```
+
+### Make ProteinTurnover target file with rt.tol from extract_peak_param
+```{r}
+#from metadata, select label_group (sample names) and catalog numbers
+sample_meta <- meta_samp %>% select(catalog_number, label_group, block)
+#from batch2_db, select compound, Identifier, # of C
+compound_meta <- batch4_db %>% select(compound, C, Identifier, mz_db)
+#join meta with peak_apex df to create target df
+compound_targets <- peak_param_avg %>% left_join(compound_meta) %>% left_join(sample_meta) %>% 
+  #add rt.tol, mz.tol, nchannels, Z columns
+mutate(
+  rt.tol = RT_width/2.5,
+  mz.tol = 0.0075,
+  C = as.numeric(C),
+  nchannels = round((.2 * C + 1), 0),
+  Z = 1,
+  ) %>% dplyr::rename(Compound = compound, MZ = mz_db, Sample = label_group) %>% 
+  #filter out intensity < 200,000
+  filter(Intensity> 200000) %>% 
+  add_count(Compound, block) %>%
+ #filter to only include paired labeled and unlabeled blocks; filter to at least 3 pairs per treatment 
+  filter(n==2) %>% add_count(Compound, amendment) %>% filter(nn > 2) %>% select(-c(C, catalog_number, Intensity, RT_width, amendment, block, n, nn))
+
+#write to .csv
+write.csv(compound_targets, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Switchgrass_2month/targets.csv")
+```
+
+### Make Molecule File for IsoCorrectoR
+```{r}
+#make molecules file (will need to subset later)
+molecules_presubset <- batch3_db %>% select(c(Identifier, Formula, C)) %>% dplyr::rename(Molecule = Identifier) %>% mutate(Formula = paste0(Formula, "LabC", C)) %>% select(Molecule, Formula)
+
+#make key for molecules file
+key <- batch3_db %>% select(Identifier, compound)
+```
+
+### Make Element File for IsoCorrectoR
+```{r}
+elements <- batch3_db %>% select(c(C, H, N, O, S, P, Identifier)) %>% dplyr::rename(Code = Identifier)
+
+write.csv(elements, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Switchgrass_2month/elementTable.csv")
+```
+
+
+## Use ProteinTurnover to extract MIDs for lipids 
+
+### Set up list of parameters for extracting isotopic XIC 
+```{r}
+t <- list()
+
+#Set the number of cores to use. 
+t$num.cores <- 1
+
+#set data directory
+t$dir.data <- "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Switchgrass_2month" 
+
+#set results directory
+t$dir.results <-  "output/pos/Michigan_Switchgrass_2month_PT" 
+
+#set target file
+t$targetfile <- "targets.csv" 
+
+#set sample names, names of mzXML files, and names of .rds files
+t$samples <- sample
+t$rawfiles <- mzXML 
+t$rdsfiles <- rds
+
+#set isotope
+t$isotope <- "C"
+
+#Set parameter to get the relative abundance from EIC (relAbForTimes).Available options are ("lm", "rlm", "lqs", "rq", "sum","log")
+
+t$regression.model <- "lm"   # "lm" as linear regression
+```
+
+### Convert raw mzXML files to Rdata files
+This only need be done once.
+This speeds up the steps below; it can be skipped if the raw files are used in addEICs.
+```{r}
+rawToRDS(t$dir.data, t$rawfiles, t$rdsfiles)
+```
+
+### Get EICs and calculate relative abundances of isotopologues using ProteinTurnover
+```{r}
+#Read the target file.
+dat2 <- readTargetFile(t$targetfile, samples=t$samples, dir=t$dir.data)
+# Prepare the data structure for each target compound
+elementTable <- read.csv("/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Switchgrass_2month/elementTable.csv")
+
+targets <- prepTargets(dat2,
+                      isotope=t$isotope)
+# Get the EIC data for each target.
+targets <- addEICs_KRR(targets, files=t$rdsfiles, type="rds", samples=t$samples, dir=t$dir.data)
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eicdata.Rdata"))
+
+# Calculate relative abundances of each isotopic channel
+targets <- mclapply.progress(targets, function(target) {
+  relAb <- makeRelAb(target, regression.model=t$regression.model)
+  list(target=target, relAb=relAb)    
+  })
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eic_rel.Rdata"))
+```
+
+### Filter ProteinTurnover Results + Create Final Target File
+```{r}
+#Extract regression and relative abundance data from ProteinTurnover results
+out <- getResults(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "relAb", "relAb.obs", "relAb.se", "relAb.Rsq", "proportion", "compound")) 
+#order columns
+out <- out[, col_order]
+#relabel
+out_relab <- out %>% mutate(Identifier = compound, compound = NULL)
+
+#quality control filtering of relative abundance regressions
+out_relab_filter <- out_relab %>% group_by(Identifier) %>%
+#to check for coelution, make sure the relative abundance of higher isotopic channels in unlabeled samples is lower than the relative abundance of the first isotopic channel
+mutate(higher_iso_max_prop = case_when(grepl("U", Sample) & channel > 1 ~ proportion, 
+                                            TRUE ~ 0),
+       higher_iso_max_prop = max(higher_iso_max_prop),
+       lower_iso_max_prop = case_when(grepl("U", Sample) & channel <= 1 ~ proportion, 
+                                   TRUE ~ 0),
+       lower_iso_max_prop = max(lower_iso_max_prop)) %>% filter(lower_iso_max_prop * 1.1 > higher_iso_max_prop) %>% group_by(Identifier, Sample) %>%
+#r-squared of regression > 0.7
+filter(relAb.Rsq >= 0.7) %>% group_by(Identifier) %>% add_count(Sample) %>%
+#require at least 3 isotopic channels (4 channel total)
+filter(n>=4) %>% 
+#for each compound, find the max # of channels that meet r-squared filtering in all samples
+mutate(max_channels = min(n)) %>% group_by(Identifier, Sample) %>% slice(1:max_channels) %>% 
+#require monoisotopic channel to be present
+filter(min(channel) == 0) %>% ungroup()
+
+#Get metrics of relative abundance data 
+metrics <- out_relab_filter %>% ungroup() %>%
+  group_by(Sample, Identifier) %>%
+#calculate min, max, mean, and weighted mean of the relative abundance standard error and R-squared
+  dplyr::summarise(Num_channels = n(), #Scans_per_channel = max(obs), 
+                   min.relAb.se = min(relAb.se, na.rm = TRUE), 
+                   max.relAb.se = max(relAb.se, na.rm = TRUE), 
+                   mean.relAb.se = mean(relAb.se, na.rm = TRUE), 
+                   min.relAb.Rsq = min(relAb.Rsq, na.rm = TRUE), 
+                   max.relAb.Rsq = max(relAb.Rsq, na.rm = TRUE), 
+                   mean.relAb.Rsq = mean(relAb.Rsq, na.rm = TRUE)) %>%
+  ungroup() %>%
+  as.data.frame(.)
+
+#filter target list to only paired labeled and unlabeled blocks and compounds with at least 3 paired reps
+compound_targets_2 <- left_join(metrics, compound_targets) %>% mutate(Sample_split = Sample, amendment = ifelse(grepl("L", Sample), "13C_Gluc", "NA_Gluc")) %>% separate(Sample_split, sep = 1, c(NA, "block")) %>%
+#filter to only paired labeled and unlabeled samples post regression filtering
+add_count(Identifier, block) %>% filter(n==2) %>% 
+#filter to only compounds with 3 unlabeled and labeled reps
+add_count(Identifier, amendment) %>% filter(nn > 2) %>% ungroup() %>%
+#remove old nchannels column
+select(-nchannels) %>%
+#rename Num_channels to nchannels
+dplyr::rename(nchannels = Num_channels) %>%
+#select necessary columns for target file
+select(c(Compound, RT, Sample, Identifier, MZ, rt.tol, mz.tol, nchannels, Z))
+
+#write to .csv
+write.csv(compound_targets_2, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Switchgrass_2month/targets_2.csv")
+```
+
+### Rerun MID calculations
+```{r}
+#set to new target file
+t$targetfile <- "targets_2.csv" 
+
+#read target file
+dat2 <- readTargetFile(t$targetfile, samples=t$samples, dir=t$dir.data)
+
+elementTable <- read.csv("/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Switchgrass_2month/elementTable.csv")
+
+targets <- prepTargets(dat2,
+                      isotope=t$isotope)
+
+## Get the EIC data for each target.
+targets <- addEICs_KRR(targets, files=t$rdsfiles, type="rds", samples=t$samples, dir=t$dir.data)
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eicdata.Rdata"))
+
+## Calculate relative abundances of each isotopic channel
+targets <- mclapply.progress(targets, function(target) {
+  relAb <- makeRelAb(target, regression.model=t$regression.model)
+  list(target=target, relAb=relAb)    
+  })
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eic_rel.Rdata"))
+
+## HTML outputs 
+#Set up multiple cores
+if(!is.null(t$num.cores)) { options(mc.cores=t$num.cores) } 
+
+#Make html output of EICs and relative abundance regressions
+out <- makeTargetHTML(targets, dir=t$dir.results, file="results-EIC")
+```
+
+
+## Use cPIE functions to generate IsoCorrectoR input files  
+
+### Get isotopologue relative abundance data for each compound from targets object
+```{r}
+#Apply function to get and format data
+out <- getResults(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "relAb", "relAb.obs", "relAb.se", "relAb.Rsq", "proportion", "compound")) 
+#adjust column order
+out <- out[, col_order]
+#format
+out_mod <- out %>%
+  mutate(ID = Sample) %>%
+  mutate(isotopologue = as.integer(channel), area = as.numeric(relAb)) %>%
+  select(compound, isotopologue, ID, area) %>%
+  spread(key = ID, value = area, fill = NA)
+
+#write output to file 
+write.table(out, file = paste("output/pos/Michigan_Switchgrass_2month_PT/ProteinTurnover_processed_output_",format(Sys.time(), "%Y-%m-%d"),".txt", sep = ""), quote = FALSE, row.names = FALSE, sep = "\t")
+```
+
+### Extract intensity/count data from targets object 
+```{r}
+## Apply function to get and format count data
+counts <- getCounts(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "RT", "Count", "BaseCount", "use", "compound")) 
+
+counts <- counts[, c("Sample", "compound", "channel", "RT", "Count", "BaseCount", "use")]
+
+#write output to file 
+write.table(counts, file = paste("output/pos/Michigan_Switchgrass_2month_PT/ProteinTurnover_counts_",format(Sys.time(), "%Y-%m-%d"),".txt", sep = ""), quote = FALSE, row.names = FALSE, sep = "\t")
+```
+
+### Create "measurement file" for IsoCorrector
+```{r}
+out_mod <- out %>%
+  mutate(ID = Sample) %>%
+  mutate(isotopologue = as.integer(channel), area = as.numeric(relAb)) %>%
+  select(compound, isotopologue, ID, area) %>%
+  spread(key = ID, value = area, fill = NA)
+
+# write output to file
+out_mod %>%
+  unite("Measurements/Samples", compound, isotopologue, sep = "_", remove = TRUE) %>%
+  arrange(desc(UB5)) %>%
+  write.csv(., file = paste("output/pos/Michigan_Switchgrass_2month_PT/Michigan_Switchgrass_2month_pos_",format(Sys.time(), "%Y-%m-%d"),".csv", sep = ""), quote = FALSE, row.names = FALSE, na = "")
+```
+
+### Subset molecule file for IsoCorrector
+```{r, eval = FALSE}
+molecules_presubset %>%
+  semi_join(., out_mod, by = c("Molecule" = "compound")) %>% mutate(MS = "") %>%
+  setNames(c("Molecule", "MS ion or MS/MS product ion", "MS/MS neutral loss")) %>%
+  write.csv(x = ., file = "output/pos/Michigan_Switchgrass_2month_PT/Michigan_Switchgrass_2month_pos_molecule_file_subset.csv", quote = FALSE, row.names = FALSE, na = "")
+```
+
+
+## Process data through IsoCorrectoR
+```{r}
+IsoCorrection(MeasurementFile = "output/pos/Michigan_Switchgrass_2month_PT/Michigan_Switchgrass_2month_pos_2022-04-12.csv", 
+              ElementFile = "data/databases/element_file.csv", 
+              MoleculeFile = "output/pos/Michigan_Switchgrass_2month_PT/Michigan_Switchgrass_2month_pos_molecule_file_subset.csv",
+              CorrectTracerImpurity = TRUE, CorrectTracerElementCore = TRUE, 
+              CalculateMeanEnrichment = TRUE, UltraHighRes = FALSE, 
+              DirOut = 'output/pos/Michigan_Switchgrass_2month_PT', 
+              FileOut = 'result', 
+              FileOutFormat = 'csv', 
+              ReturnResultsObject = TRUE, CorrectAlsoMonoisotopic = FALSE, 
+              CalculationThreshold = 10^-10, 
+              CalculationThreshold_UHR = 8, 
+              verbose = TRUE, Testmode = FALSE)
+```
+
+
+## Combine and post-process cPIE data  
+  
+### Read and calculate spectrum intensity/count data
+```{r}
+# Aggregate various scans (indexed by retention times) to the level of compound*isotopologue (i.e., channel)
+counts_mod <- counts %>%
+  mutate(Identifier = compound, compound = NULL) %>%
+  group_by(Identifier, Sample, channel) %>%
+  dplyr::summarise(obs = n(), Total = sum(Count), check = sum(use), .groups = "keep") %>%
+  ungroup()
+```
+
+### Read in processed relative abundance (ProteinTurnover) output
+```{r PT_import}
+# Relative abundance data stored in object "out"; Use channel-specific metrics like relative abundance R-squared values for quality control.
+out_relab <- out %>% mutate(Identifier = compound, compound = NULL)
+```
+
+### Read in processed IsoCorrectoR data
+```{r isoR_data_in}
+isoR_enrich <- read.csv("output/pos/Michigan_Switchgrass_2month_PT/2022-04-12_114127/IsoCorrectoR_result_MeanEnrichment.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+
+isoR_resid <- read.csv("output/pos/Michigan_Switchgrass_2month_PT/2022-04-12_114127/IsoCorrectoR_result_Residuals.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+
+isoR_correct <- read.csv("output/pos/Michigan_Switchgrass_2month_PT/2022-04-12_114127/IsoCorrectoR_result_Corrected.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+```
+
+### Generate long-format data
+```{r long_exp}
+#Manipulate data into long format
+isoR_enrich_long <- tidyr::pivot_longer(data = isoR_enrich, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "mean.enrichment") %>% dplyr::rename(Identifier = X)
+
+#These contain channel-specific data
+isoR_resid_long <- tidyr::pivot_longer(data = isoR_resid, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "residuals") %>% 
+  dplyr::rename(Identifier = X) %>%
+  mutate(Identifier = as.character(Identifier), residuals.abs = abs(residuals)) %>%
+  separate(col = "Identifier", into = c("Identifier", "channel"), sep = "_", remove = TRUE, convert = TRUE, extra = "warn", fill = "warn")
+
+isoR_correct_long <- tidyr::pivot_longer(data = isoR_correct, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "Cor.relAb") %>%
+  dplyr::rename(Identifier = X) %>%
+  mutate(Identity = as.character(Identifier)) %>%
+  separate(col = "Identifier", into = c("Identifier", "channel"), sep = "_", remove = TRUE, convert = TRUE, extra = "warn", fill = "warn")
+```
+
+### Aggregate channel-level and compound-level data
+```{r}
+## Remember that out_relab and counts_mod contain isotopologue/channel-specific data (no longer scan-specific)
+channel_metrics <- left_join(out_relab, counts_mod, by = c("Identifier", "Sample", "channel")) %>%
+  left_join(., isoR_resid_long, by = c("Identifier", "Sample", "channel")) %>%
+  left_join(., isoR_correct_long, by = c("Identifier", "Sample", "channel"))
+```
+
+### Calculate the mean, weighted mean, max, and min values across all channels for each error metric
+```{r}
+ compound_metrics <- channel_metrics %>%
+  group_by(Sample, Identifier) %>%
+  dplyr::summarise(Num_channels = n(), Scans_per_channel = max(obs), 
+                   Intensity = sum(Total, na.rm = TRUE), 
+                   min.relAb.se = min(relAb.se, na.rm = TRUE), 
+                   max.relAb.se = max(relAb.se, na.rm = TRUE), 
+                   mean.relAb.se = mean(relAb.se, na.rm = TRUE), 
+                   wtmean.relAb.se = weighted.mean(relAb.se, Total, na.rm = TRUE), 
+                   min.relAb.Rsq = min(relAb.Rsq, na.rm = TRUE), 
+                   max.relAb.Rsq = max(relAb.Rsq, na.rm = TRUE), 
+                   mean.relAb.Rsq = mean(relAb.Rsq, na.rm = TRUE), 
+                   wtmean.relAb.Rsq = weighted.mean(relAb.Rsq, Total, na.rm = TRUE),
+                   min.residuals = min(residuals, na.rm = TRUE), 
+                   max.residuals = max(residuals, na.rm = TRUE), 
+                   mean.residuals = mean(residuals, na.rm = TRUE), 
+                   wtmean.residuals = weighted.mean(residuals, Total, na.rm = TRUE),
+                   min.residuals.abs = min(residuals.abs, na.rm = TRUE), 
+                   max.residuals.abs = max(residuals.abs, na.rm = TRUE), 
+                   mean.residuals.abs = mean(residuals.abs, na.rm = TRUE), 
+                   wtmean.residuals.abs = weighted.mean(residuals.abs, Total, na.rm = TRUE), 
+                   Total.Cor.relAb = sum(Cor.relAb, na.rm = TRUE),
+                   Total.Obs.relAb = sum(relAb, na.rm = TRUE), .groups = "keep") %>%
+  ungroup() %>%
+  mutate(TotalResidual = as.numeric(Total.Cor.relAb/Total.Obs.relAb)) %>%
+  mutate(TotalResidual.log = ifelse(TotalResidual == 0, NA, log10(TotalResidual))) %>% ## check for zeroes so don't produce -Inf
+  as.data.frame(.)
+```
+
+### Join compound-aggregated error estimates with mean.enrichment output  
+```{r}
+compounds_metrics_enrich <- isoR_enrich_long %>%
+  left_join(compound_metrics, ., by = c("Identifier", "Sample")) %>%
+#join with key to get compound names
+left_join(key) %>%
+#add column "Label" to indicate labeling treatment (unlabeled vs labeled) and "Rep" with the rep #
+mutate(Sample_category = "Michigan_Switchgrass_2month", Label = ifelse(grepl("L", Sample), "labeled", "unlabeled"), Rep = regmatches(Sample, gregexpr("[[:digit:]]+", Sample)), Rep = as.numeric(Rep))
+
+saveRDS(compounds_metrics_enrich, "output/pos/Michigan_Switchgrass_2month_PT/compounds_metrics_enrich.RDS")
+```
+
+### Calculate paired rep (labeled vs unlabeled) relative mean enrichment & implement paired t-test with Cohen's D 
+```{r}
+#paired t-test
+t_test <- compounds_metrics_enrich %>% 
+  group_by(Sample_category, Identifier, compound) %>%
+  t_test(mean.enrichment ~ Label, paired = TRUE, detailed = TRUE) %>%
+  add_significance() 
+  
+#calculate effect size (Cohen's D)
+cohens_d <- compounds_metrics_enrich %>% 
+  group_by(Sample_category, Identifier, compound) %>%
+  cohens_d(mean.enrichment ~ Label, paired = TRUE)
+
+#calculate relative enrichment between unlabeled and labeled reps
+rel_enrich <- compounds_metrics_enrich %>%
+  group_by(Sample_category, Identifier, compound, Rep) %>% 
+  pivot_wider(names_from = Label, values_from = mean.enrichment) %>% 
+  summarise(labeled = dplyr::first(na.omit(labeled)),
+      unlabeled = dplyr::first(na.omit(unlabeled))) %>%
+  mutate(rel_enrichment = labeled - unlabeled) %>%
+#calculate mean + sd enrichment difference between unlabeled and labeled rep pairs
+  group_by(Sample_category, Identifier, compound) %>% 
+  summarize(mean_rel_enrichment = mean(rel_enrichment), 
+         sd_rel_enrichment = sd(rel_enrichment))
+
+#combine
+Michigan_Switchgrass_2month_pos <- left_join(t_test, cohens_d) %>% left_join(rel_enrich)
+saveRDS(Michigan_Switchgrass_2month_pos, "output/pos/Michigan_Switchgrass_2month_PT/Michigan_Switchgrass_2month_pos.RDS" )
+```
+
+### Pull out putatively enriched compounds (p < 0.05, effsize > 0.5) and plot paired boxplots
+```{r}
+#filter significant p-values and create vector of corresponding identifiers
+significant <- Michigan_Switchgrass_2month_pos %>% filter(p < 0.05 & effsize > 0.5)
+significant_vec <- significant$Identifier
+
+#plot paired boxed plots of (significant) putatively enriched compounds
+signif_paired_boxplot(significant_vec, compounds_metrics_enrich, "output/pos/Michigan_Switchgrass_2month_PT/pairedboxplots.pdf")
+```
+
+
+
+# Wisconsin Switchgrass, 1 year
+
+## Prepare input files for extraction of MIDs of identified lipids using ProteinTurnover 
+
+### Create vectors of sample names, file extensions, and catalog numbers from metadata
+```{r}
+#filter metadata to just batch 3
+meta_samp <- meta %>% filter(batch == "3" & polarity == "positive") %>% filter(site == "Wisconsin" & crop == "Switchgrass" & timepoint == "Final")
+
+#add columns to metadata
+meta_samp <- meta_samp %>% mutate(
+  #create label of labeled/unlabeled and rep (block)
+  label_group = ifelse(amendment == "13C_Gluc", "L", "U"),
+  label_group = paste0(label_group, block), 
+  #add .rds file extension
+  sample_name_rds = reader::rmv.ext(sample_name, only.known = FALSE), 
+  sample_name_rds = paste0(sample_name_rds, ".rds")
+)
+
+#create vectors of sample names, mzXML file extensions, rds file extensions, and catalog numbers
+sample <- meta_samp$label_group
+mzXML <- meta_samp$sample_name
+rds <- meta_samp$sample_name_rds 
+sample_filt <- meta_samp$catalog_number
+```
+
+### Import raw .mzXML files and execute peak-picking 
+```{r}
+#path to .mzXML files
+dda_folder = "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Switchgrass_1year"
+#list all files inside specified folder
+mzXMLfiles_dda <- list.files(dda_folder, recursive = TRUE, full.names = TRUE, pattern = "\\.mzXML$")
+#create dataframe witg file extensions and sample names
+pd_samp <- data.frame(extension = mzXMLfiles_dda, sample_name = basename(mzXMLfiles_dda))
+#merge metadata with phenodata frame 
+pd_samp <- left_join(meta_samp, pd_samp, by = "sample_name")
+#export ordered file list
+samps <- as.vector(pd_samp$extension)
+
+#load data 
+dda_data <- readMSData(samps,  pdata = new("NAnnotatedDataFrame", pd_samp), centroided = TRUE, mode = "onDisk")
+
+#set peak-picking parameters
+cwp <- CentWaveParam(A = 4.289723e-07, ppm=1, Instrument=2, peakwidth=c(2.5, 45), snthresh = 10, noise=10000, prefilter=c(3, 100000), firstBaselineCheck = FALSE, integrate=2)
+
+#pick peaks
+dda_data_peaks <- findChromPeaks(dda_data, param = cwp)
+```
+
+### Plot up monoisotopic XICs for targets and manually adjust (if needed) the RT window for peak RT and intensity extraction
+```{r}
+#create target list for XIC plots 
+rt_targets <- LIQUID_batch3_RT_dupremov_man %>% select(-c(count, Average.Intensity)) %>% dplyr::rename(compound = Common.Name, mz_db = Exact.m.z, rt_db = Average.Apex.RT) %>% mutate(rt_window = 30) %>% ungroup()
+
+#plot
+raw_XIC_plot(rt_targets, dda_data_peaks)
+
+#manual adjustments to target list before apex RT and intensity extraction
+rt_targets_2 <- rt_targets %>% mutate(
+  #adjust rt_window for compounds manually for messy EICs
+  rt_window = case_when(
+    grepl("TG(18:1/20:3/20:4)", compound, fixed=TRUE) ~ 15,
+    grepl("TG(18:1/20:1/20:4)", compound, fixed=TRUE) ~ 15,
+    grepl("Cer(d20:0/16:0)", compound, fixed=TRUE) ~ 15,
+    TRUE ~ rt_window
+  )
+)
+```
+
+
+### Peak apex RT and intensity extraction
+```{r}
+#extract peak intensity and retention time
+peak_param <- extract_peak_param(rt_targets_2, dda_data_peaks)
+
+#convert intensity and retention time columns to class numeric for filtering
+peak_param <- peak_param %>% ungroup() %>% mutate(Intensity = as.numeric(as.character(Intensity)), RT = as.numeric(as.character(RT)), RT_width = as.numeric(as.character(RT_width)), compound = as.character(compound))
+#except for FA that vary significantly in RT, average RT; average RT_width for all
+peak_param_avg <- peak_param %>% group_by(compound) %>% mutate(
+  RT = case_when(
+    grepl("FA", compound) ~ RT,
+    TRUE ~ mean(RT, na.rm = TRUE)
+    ), 
+  RT_width = mean(RT_width, na.rm = TRUE)
+)
+```
+
+### Make ProteinTurnover target file with rt.tol from extract_peak_param
+```{r}
+#from metadata, select label_group (sample names) and catalog numbers
+sample_meta <- meta_samp %>% select(catalog_number, label_group, block)
+#from batch2_db, select compound, Identifier, # of C
+compound_meta <- batch3_db %>% select(compound, C, Identifier, mz_db)
+#join meta with peak_apex df to create target df
+compound_targets <- peak_param_avg %>% left_join(compound_meta)  %>% left_join(sample_meta) %>% 
+  #add rt.tol, mz.tol, nchannels, Z columns
+mutate(
+  rt.tol = RT_width/2.5,
+  mz.tol = 0.0075,
+  C = as.numeric(C),
+  nchannels = round((.2 * C + 1), 0),
+  Z = 1,
+  ) %>% dplyr::rename(Compound = compound, MZ = mz_db, Sample = label_group) %>% 
+  #filter out intensity < 300000
+  filter(Intensity > 300000) %>% 
+  add_count(Compound, block) %>%
+ #filter to only include paired labeled and unlabeled blocks; filter to at least 3 pairs per treatment 
+  filter(n==2) %>% add_count(Compound, amendment) %>% filter(nn > 2) %>% select(-c(C, catalog_number, Intensity, RT_width, amendment, block, n, nn))
+
+#write to .csv
+write.csv(compound_targets, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Switchgrass_1year/targets.csv")
+```
+
+### Make Molecule File for IsoCorrectoR
+```{r}
+#make molecules file (will need to subset later)
+molecules_presubset <- batch3_db %>% select(c(Identifier, Formula, C)) %>% dplyr::rename(Molecule = Identifier) %>% mutate(Formula = paste0(Formula, "LabC", C)) %>% select(Molecule, Formula)
+
+#make key for molecules file
+key <- batch3_db %>% select(Identifier, compound)
+```
+
+### Make Element File for IsoCorrectoR
+```{r}
+elements <- batch3_db %>% select(c(C, H, N, O, S, P, Identifier)) %>% dplyr::rename(Code = Identifier)
+
+write.csv(elements, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Switchgrass_1year/elementTable.csv")
+```
+
+
+## Use ProteinTurnover to extract MIDs for lipids 
+
+### Set up list of parameters for extracting isotopic XIC 
+```{r}
+t <- list()
+
+#Set the number of cores to use. 
+t$num.cores <- 1
+
+#set data directory
+t$dir.data <- "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Switchgrass_1year" 
+
+#set results directory
+t$dir.results <-  "output/pos/Wisconsin_Switchgrass_1year_PT" 
+
+#set target file
+t$targetfile <- "targets.csv" 
+
+#set sample names, names of mzXML files, and names of .rds files
+t$samples <- sample
+t$rawfiles <- mzXML 
+t$rdsfiles <- rds
+
+#set isotope
+t$isotope <- "C"
+
+#Set parameter to get the relative abundance from EIC (relAbForTimes).Available options are ("lm", "rlm", "lqs", "rq", "sum","log")
+
+t$regression.model <- "lm"   # "lm" as linear regression
+```
+
+### Convert raw mzXML files to Rdata files
+This only need be done once.
+This speeds up the steps below; it can be skipped if the raw files are used in addEICs.
+```{r}
+rawToRDS(t$dir.data, t$rawfiles, t$rdsfiles)
+```
+
+### Get EICs and calculate relative abundances of isotopologues using ProteinTurnover
+```{r}
+#Read the target file.
+dat2 <- readTargetFile(t$targetfile, samples=t$samples, dir=t$dir.data)
+# Prepare the data structure for each target compound
+elementTable <- read.csv("/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Switchgrass_1year/elementTable.csv")
+
+targets <- prepTargets(dat2,
+                      isotope=t$isotope)
+# Get the EIC data for each target.
+targets <- addEICs_KRR(targets, files=t$rdsfiles, type="rds", samples=t$samples, dir=t$dir.data)
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eicdata.Rdata"))
+
+# Calculate relative abundances of each isotopic channel
+targets <- mclapply.progress(targets, function(target) {
+  relAb <- makeRelAb(target, regression.model=t$regression.model)
+  list(target=target, relAb=relAb)    
+  })
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eic_rel.Rdata"))
+```
+
+### Filter ProteinTurnover Results + Create Final Target File
+```{r}
+#Extract regression and relative abundance data from ProteinTurnover results
+out <- getResults(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "relAb", "relAb.obs", "relAb.se", "relAb.Rsq", "proportion", "compound")) 
+#order columns
+out <- out[, col_order]
+#relabel
+out_relab <- out %>% mutate(Identifier = compound, compound = NULL)
+
+#quality control filtering of relative abundance regressions
+out_relab_filter <- out_relab %>% group_by(Identifier) %>%
+#to check for coelution, make sure the relative abundance of higher isotopic channels in unlabeled samples is lower than the relative abundance of the first isotopic channel
+mutate(higher_iso_max_prop = case_when(grepl("U", Sample) & channel > 1 ~ proportion, 
+                                            TRUE ~ 0),
+       higher_iso_max_prop = max(higher_iso_max_prop),
+       lower_iso_max_prop = case_when(grepl("U", Sample) & channel <= 1 ~ proportion, 
+                                   TRUE ~ 0),
+       lower_iso_max_prop = max(lower_iso_max_prop)) %>% filter(lower_iso_max_prop * 1.1 > higher_iso_max_prop) %>% group_by(Identifier, Sample) %>%
+#r-squared of regression > 0.7
+filter(relAb.Rsq >= 0.7) %>% group_by(Identifier) %>% add_count(Sample) %>%
+#require at least 3 isotopic channels (4 channel total)
+filter(n>=4) %>% 
+#for each compound, find the max # of channels that meet r-squared filtering in all samples
+mutate(max_channels = min(n)) %>% group_by(Identifier, Sample) %>% slice(1:max_channels) %>% 
+#require monoisotopic channel to be present
+filter(min(channel) == 0) %>% ungroup()
+
+#Get metrics of relative abundance data 
+metrics <- out_relab_filter %>% ungroup() %>%
+  group_by(Sample, Identifier) %>%
+#calculate min, max, mean, and weighted mean of the relative abundance standard error and R-squared
+  dplyr::summarise(Num_channels = n(), #Scans_per_channel = max(obs), 
+                   min.relAb.se = min(relAb.se, na.rm = TRUE), 
+                   max.relAb.se = max(relAb.se, na.rm = TRUE), 
+                   mean.relAb.se = mean(relAb.se, na.rm = TRUE), 
+                   min.relAb.Rsq = min(relAb.Rsq, na.rm = TRUE), 
+                   max.relAb.Rsq = max(relAb.Rsq, na.rm = TRUE), 
+                   mean.relAb.Rsq = mean(relAb.Rsq, na.rm = TRUE)) %>%
+  ungroup() %>%
+  as.data.frame(.)
+
+#filter target list to only paired labeled and unlabeled blocks and compounds with at least 3 paired reps
+compound_targets_2 <- left_join(metrics, compound_targets) %>% mutate(Sample_split = Sample, amendment = ifelse(grepl("L", Sample), "13C_Gluc", "NA_Gluc")) %>% separate(Sample_split, sep = 1, c(NA, "block")) %>%
+#filter to only paired labeled and unlabeled samples post regression filtering
+add_count(Identifier, block) %>% filter(n==2) %>% 
+#filter to only compounds with 3 unlabeled and labeled reps
+add_count(Identifier, amendment) %>% filter(nn > 2) %>% ungroup() %>%
+#remove old nchannels column
+select(-nchannels) %>%
+#rename Num_channels to nchannels
+dplyr::rename(nchannels = Num_channels) %>%
+#select necessary columns for target file
+select(c(Compound, RT, Sample, Identifier, MZ, rt.tol, mz.tol, nchannels, Z))
+
+#write to .csv
+write.csv(compound_targets_2, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Switchgrass_1year/targets_2.csv")
+```
+
+### Rerun MID calculations
+```{r}
+#set to new target file
+t$targetfile <- "targets_2.csv" 
+
+#read target file
+dat2 <- readTargetFile(t$targetfile, samples=t$samples, dir=t$dir.data)
+
+elementTable <- read.csv("/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Switchgrass_1year/elementTable.csv")
+
+targets <- prepTargets(dat2,
+                      isotope=t$isotope)
+
+## Get the EIC data for each target.
+targets <- addEICs_KRR(targets, files=t$rdsfiles, type="rds", samples=t$samples, dir=t$dir.data)
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eicdata.Rdata"))
+
+## Calculate relative abundances of each isotopic channel
+targets <- mclapply.progress(targets, function(target) {
+  relAb <- makeRelAb(target, regression.model=t$regression.model)
+  list(target=target, relAb=relAb)    
+  })
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eic_rel.Rdata"))
+
+## HTML outputs 
+#Set up multiple cores
+if(!is.null(t$num.cores)) { options(mc.cores=t$num.cores) } 
+
+#Make html output of EICs and relative abundance regressions
+out <- makeTargetHTML(targets, dir=t$dir.results, file="results-EIC")
+```
+
+
+## Use cPIE functions to generate IsoCorrectoR input files  
+
+### Get isotopologue relative abundance data for each compound from targets object
+```{r}
+#Apply function to get and format data
+out <- getResults(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "relAb", "relAb.obs", "relAb.se", "relAb.Rsq", "proportion", "compound")) 
+#adjust column order
+out <- out[, col_order]
+#format
+out_mod <- out %>%
+  mutate(ID = Sample) %>%
+  mutate(isotopologue = as.integer(channel), area = as.numeric(relAb)) %>%
+  select(compound, isotopologue, ID, area) %>%
+  spread(key = ID, value = area, fill = NA)
+
+#write output to file 
+write.table(out, file = paste("output/pos/Wisconsin_Switchgrass_1year_PT/ProteinTurnover_processed_output_",format(Sys.time(), "%Y-%m-%d"),".txt", sep = ""), quote = FALSE, row.names = FALSE, sep = "\t")
+```
+
+### Extract intensity/count data from targets object 
+```{r}
+## Apply function to get and format count data
+counts <- getCounts(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "RT", "Count", "BaseCount", "use", "compound")) 
+
+counts <- counts[, c("Sample", "compound", "channel", "RT", "Count", "BaseCount", "use")]
+
+#write output to file 
+write.table(counts, file = paste("output/pos/Wisconsin_Switchgrass_1year_PT/ProteinTurnover_counts_",format(Sys.time(), "%Y-%m-%d"),".txt", sep = ""), quote = FALSE, row.names = FALSE, sep = "\t")
+```
+
+### Create "measurement file" for IsoCorrector
+```{r}
+out_mod <- out %>%
+  mutate(ID = Sample) %>%
+  mutate(isotopologue = as.integer(channel), area = as.numeric(relAb)) %>%
+  select(compound, isotopologue, ID, area) %>%
+  spread(key = ID, value = area, fill = NA)
+
+# write output to file
+out_mod %>%
+  unite("Measurements/Samples", compound, isotopologue, sep = "_", remove = TRUE) %>%
+  arrange(desc(UB5)) %>%
+  write.csv(., file = paste("output/pos/Wisconsin_Switchgrass_1year_PT/Wisconsin_Switchgrass_1year_pos_",format(Sys.time(), "%Y-%m-%d"),".csv", sep = ""), quote = FALSE, row.names = FALSE, na = "")
+```
+
+### Subset molecule file for IsoCorrector
+```{r, eval = FALSE}
+molecules_presubset %>%
+  semi_join(., out_mod, by = c("Molecule" = "compound")) %>% mutate(MS = "") %>%
+  setNames(c("Molecule", "MS ion or MS/MS product ion", "MS/MS neutral loss")) %>%
+  write.csv(x = ., file = "output/pos/Wisconsin_Switchgrass_1year_PT/Wisconsin_Switchgrass_1year_pos_molecule_file_subset.csv", quote = FALSE, row.names = FALSE, na = "")
+```
+
+
+## Process data through IsoCorrectoR
+```{r}
+IsoCorrection(MeasurementFile = "output/pos/Wisconsin_Switchgrass_1year_PT/Wisconsin_Switchgrass_1year_pos_2022-04-12.csv", 
+              ElementFile = "data/databases/element_file.csv", 
+              MoleculeFile = "output/pos/Wisconsin_Switchgrass_1year_PT/Wisconsin_Switchgrass_1year_pos_molecule_file_subset.csv",
+              CorrectTracerImpurity = TRUE, CorrectTracerElementCore = TRUE, 
+              CalculateMeanEnrichment = TRUE, UltraHighRes = FALSE, 
+              DirOut = 'output/pos/Wisconsin_Switchgrass_1year_PT', 
+              FileOut = 'result', 
+              FileOutFormat = 'csv', 
+              ReturnResultsObject = TRUE, CorrectAlsoMonoisotopic = FALSE, 
+              CalculationThreshold = 10^-10, 
+              CalculationThreshold_UHR = 8, 
+              verbose = TRUE, Testmode = FALSE)
+```
+
+
+## Combine and post-process cPIE data  
+  
+### Read and calculate spectrum intensity/count data
+```{r}
+# Aggregate various scans (indexed by retention times) to the level of compound*isotopologue (i.e., channel)
+counts_mod <- counts %>%
+  mutate(Identifier = compound, compound = NULL) %>%
+  group_by(Identifier, Sample, channel) %>%
+  dplyr::summarise(obs = n(), Total = sum(Count), check = sum(use), .groups = "keep") %>%
+  ungroup()
+```
+
+### Read in processed relative abundance (ProteinTurnover) output
+```{r PT_import}
+# Relative abundance data stored in object "out"; Use channel-specific metrics like relative abundance R-squared values for quality control.
+out_relab <- out %>% mutate(Identifier = compound, compound = NULL)
+```
+
+### Read in processed IsoCorrectoR data
+```{r isoR_data_in}
+isoR_enrich <- read.csv("output/pos/Wisconsin_Switchgrass_1year_PT/2022-04-12_132850/IsoCorrectoR_result_MeanEnrichment.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+
+isoR_resid <- read.csv("output/pos/Wisconsin_Switchgrass_1year_PT/2022-04-12_132850/IsoCorrectoR_result_Residuals.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+
+isoR_correct <- read.csv("output/pos/Wisconsin_Switchgrass_1year_PT/2022-04-12_132850/IsoCorrectoR_result_Corrected.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+```
+
+### Generate long-format data
+```{r long_exp}
+#Manipulate data into long format
+isoR_enrich_long <- tidyr::pivot_longer(data = isoR_enrich, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "mean.enrichment") %>% dplyr::rename(Identifier = X)
+
+#These contain channel-specific data
+isoR_resid_long <- tidyr::pivot_longer(data = isoR_resid, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "residuals") %>% 
+  dplyr::rename(Identifier = X) %>%
+  mutate(Identifier = as.character(Identifier), residuals.abs = abs(residuals)) %>%
+  separate(col = "Identifier", into = c("Identifier", "channel"), sep = "_", remove = TRUE, convert = TRUE, extra = "warn", fill = "warn")
+
+isoR_correct_long <- tidyr::pivot_longer(data = isoR_correct, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "Cor.relAb") %>%
+  dplyr::rename(Identifier = X) %>%
+  mutate(Identity = as.character(Identifier)) %>%
+  separate(col = "Identifier", into = c("Identifier", "channel"), sep = "_", remove = TRUE, convert = TRUE, extra = "warn", fill = "warn")
+```
+
+### Aggregate channel-level and compound-level data
+```{r}
+## Remember that out_relab and counts_mod contain isotopologue/channel-specific data (no longer scan-specific)
+channel_metrics <- left_join(out_relab, counts_mod, by = c("Identifier", "Sample", "channel")) %>%
+  left_join(., isoR_resid_long, by = c("Identifier", "Sample", "channel")) %>%
+  left_join(., isoR_correct_long, by = c("Identifier", "Sample", "channel"))
+```
+
+### Calculate the mean, weighted mean, max, and min values across all channels for each error metric
+```{r}
+ compound_metrics <- channel_metrics %>%
+  group_by(Sample, Identifier) %>%
+  dplyr::summarise(Num_channels = n(), Scans_per_channel = max(obs), 
+                   Intensity = sum(Total, na.rm = TRUE), 
+                   min.relAb.se = min(relAb.se, na.rm = TRUE), 
+                   max.relAb.se = max(relAb.se, na.rm = TRUE), 
+                   mean.relAb.se = mean(relAb.se, na.rm = TRUE), 
+                   wtmean.relAb.se = weighted.mean(relAb.se, Total, na.rm = TRUE), 
+                   min.relAb.Rsq = min(relAb.Rsq, na.rm = TRUE), 
+                   max.relAb.Rsq = max(relAb.Rsq, na.rm = TRUE), 
+                   mean.relAb.Rsq = mean(relAb.Rsq, na.rm = TRUE), 
+                   wtmean.relAb.Rsq = weighted.mean(relAb.Rsq, Total, na.rm = TRUE),
+                   min.residuals = min(residuals, na.rm = TRUE), 
+                   max.residuals = max(residuals, na.rm = TRUE), 
+                   mean.residuals = mean(residuals, na.rm = TRUE), 
+                   wtmean.residuals = weighted.mean(residuals, Total, na.rm = TRUE),
+                   min.residuals.abs = min(residuals.abs, na.rm = TRUE), 
+                   max.residuals.abs = max(residuals.abs, na.rm = TRUE), 
+                   mean.residuals.abs = mean(residuals.abs, na.rm = TRUE), 
+                   wtmean.residuals.abs = weighted.mean(residuals.abs, Total, na.rm = TRUE), 
+                   Total.Cor.relAb = sum(Cor.relAb, na.rm = TRUE),
+                   Total.Obs.relAb = sum(relAb, na.rm = TRUE), .groups = "keep") %>%
+  ungroup() %>%
+  mutate(TotalResidual = as.numeric(Total.Cor.relAb/Total.Obs.relAb)) %>%
+  mutate(TotalResidual.log = ifelse(TotalResidual == 0, NA, log10(TotalResidual))) %>% ## check for zeroes so don't produce -Inf
+  as.data.frame(.)
+```
+
+### Join compound-aggregated error estimates with mean.enrichment output  
+```{r}
+compounds_metrics_enrich <- isoR_enrich_long %>%
+  left_join(compound_metrics, ., by = c("Identifier", "Sample")) %>%
+#join with key to get compound names
+left_join(key) %>%
+#add column "Label" to indicate labeling treatment (unlabeled vs labeled) and "Rep" with the rep #
+mutate(Sample_category = "Wisconsin_Switchgrass_1year", Label = ifelse(grepl("L", Sample), "labeled", "unlabeled"), Rep = regmatches(Sample, gregexpr("[[:digit:]]+", Sample)), Rep = as.numeric(Rep))
+
+saveRDS(compounds_metrics_enrich, "output/pos/Wisconsin_Switchgrass_1year_PT/compounds_metrics_enrich.RDS")
+```
+
+### Calculate paired rep (labeled vs unlabeled) relative mean enrichment & implement paired t-test with Cohen's D 
+```{r}
+#paired t-test
+t_test <- compounds_metrics_enrich %>% 
+  group_by(Sample_category, Identifier, compound) %>%
+  t_test(mean.enrichment ~ Label, paired = TRUE, detailed = TRUE) %>%
+  add_significance() 
+  
+#calculate effect size (Cohen's D)
+cohens_d <- compounds_metrics_enrich %>% 
+  group_by(Sample_category, Identifier, compound) %>%
+  cohens_d(mean.enrichment ~ Label, paired = TRUE)
+
+#calculate relative enrichment between unlabeled and labeled reps
+rel_enrich <- compounds_metrics_enrich %>%
+  group_by(Sample_category, Identifier, compound, Rep) %>% 
+  pivot_wider(names_from = Label, values_from = mean.enrichment) %>% 
+  summarise(labeled = dplyr::first(na.omit(labeled)),
+      unlabeled = dplyr::first(na.omit(unlabeled))) %>%
+  mutate(rel_enrichment = labeled - unlabeled) %>%
+#calculate mean + sd enrichment difference between unlabeled and labeled rep pairs
+  group_by(Sample_category, Identifier, compound) %>% 
+  summarize(mean_rel_enrichment = mean(rel_enrichment), 
+         sd_rel_enrichment = sd(rel_enrichment))
+
+#combine
+Wisconsin_Switchgrass_1year_pos <- left_join(t_test, cohens_d) %>% left_join(rel_enrich)
+saveRDS(Wisconsin_Switchgrass_1year_pos, "output/pos/Wisconsin_Switchgrass_1year_PT/Wisconsin_Switchgrass_1year_pos.RDS" )
+```
+
+### Pull out putatively enriched compounds (p < 0.05, effsize > 0.5) and plot paired boxplots
+```{r}
+#filter significant p-values and create vector of corresponding identifiers
+significant <- Wisconsin_Switchgrass_1year_pos %>% filter(p < 0.05 & effsize > 0.5)
+significant_vec <- significant$Identifier
+
+#plot paired boxed plots of (significant) putatively enriched compounds
+signif_paired_boxplot(significant_vec, compounds_metrics_enrich, "output/pos/Wisconsin_Switchgrass_1year_PT/pairedboxplots.pdf")
+```
+
+
+## Michigan Switchgrass 1 Year
+
+## Prepare input files for extraction of MIDs of identified lipids using ProteinTurnover 
+
+### Create vectors of sample names, file extensions, and catalog numbers from metadata
+```{r}
+#filter metadata to just batch 2
+meta_samp <- meta %>% filter(batch == "3" & polarity == "positive") %>% filter(site == "Michigan" & crop == "Switchgrass" & timepoint == "Final")
+
+#add columns to metadata
+meta_samp <- meta_samp %>% mutate(
+  #create label of labeled/unlabeled and rep (block)
+  label_group = ifelse(amendment == "13C_Gluc", "L", "U"),
+  label_group = paste0(label_group, block), 
+  #add .rds file extension
+  sample_name_rds = reader::rmv.ext(sample_name, only.known = FALSE), 
+  sample_name_rds = paste0(sample_name_rds, ".rds")
+)
+
+#create vectors of sample names, mzXML file extensions, rds file extensions, and catalog numbers
+sample <- meta_samp$label_group
+mzXML <- meta_samp$sample_name
+rds <- meta_samp$sample_name_rds 
+sample_filt <- meta_samp$catalog_number
+```
+
+### Import raw .mzXML files and execute peak-picking 
+```{r}
+#path to .mzXML files
+dda_folder = "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Switchgrass_1year"
+#list all files inside specified folder
+mzXMLfiles_dda <- list.files(dda_folder, recursive = TRUE, full.names = TRUE, pattern = "\\.mzXML$")
+#create dataframe witg file extensions and sample names
+pd_samp <- data.frame(extension = mzXMLfiles_dda, sample_name = basename(mzXMLfiles_dda))
+#merge metadata with phenodata frame 
+pd_samp <- left_join(meta_samp, pd_samp, by = "sample_name")
+#export ordered file list
+samps <- as.vector(pd_samp$extension)
+
+#load data 
+dda_data <- readMSData(samps,  pdata = new("NAnnotatedDataFrame", pd_samp), centroided = TRUE, mode = "onDisk")
+
+#set peak-picking parameters
+cwp <- CentWaveParam(A = 4.289723e-07, ppm=1, Instrument=2, peakwidth=c(2.5, 45), snthresh = 10, noise=10000, prefilter=c(3, 100000), firstBaselineCheck = FALSE, integrate=2)
+
+#pick peaks
+dda_data_peaks <- findChromPeaks(dda_data, param = cwp)
+```
+
+### Plot up monoisotopic XICs for targets and manually adjust (if needed) the RT window for peak RT and intensity extraction
+```{r}
+#create target list for XIC plots 
+rt_targets <- LIQUID_batch3_RT_dupremov_man %>% select(-c(count, Average.Intensity)) %>% dplyr::rename(compound = Common.Name, mz_db = Exact.m.z, rt_db = Average.Apex.RT) %>% mutate(rt_window = 30) %>% ungroup()
+
+#plot
+raw_XIC_plot(rt_targets, dda_data_peaks)
+
+#manual adjustments to target list before apex RT and intensity extraction
+rt_targets_2 <- rt_targets %>% mutate(
+  #adjust rt_window for compounds manually for messy EICs
+  rt_window = case_when(
+    grepl("TG(18:1/20:3/20:4)", compound, fixed=TRUE) ~ 15,
+    grepl("TG(18:1/20:1/20:4)", compound, fixed=TRUE) ~ 15,
+    grepl("Cer(d20:0/16:0)", compound, fixed=TRUE) ~ 15,
+    TRUE ~ rt_window
+  )
+)
+```
+
+
+### Peak apex RT and intensity extraction
+```{r}
+#extract peak intensity and retention time
+peak_param <- extract_peak_param(rt_targets_2, dda_data_peaks)
+
+#convert intensity and retention time columns to class numeric for filtering
+peak_param <- peak_param %>% ungroup() %>% mutate(Intensity = as.numeric(as.character(Intensity)), RT = as.numeric(as.character(RT)), RT_width = as.numeric(as.character(RT_width)), compound = as.character(compound))
+#except for FA that vary significantly in RT, average RT; average RT_width for all
+peak_param_avg <- peak_param %>% group_by(compound) %>% mutate(
+  RT = case_when(
+    grepl("FA", compound) ~ RT,
+    TRUE ~ mean(RT, na.rm = TRUE)
+    ), 
+  RT_width = mean(RT_width, na.rm = TRUE)
+)
+```
+
+### Make ProteinTurnover target file with rt.tol from extract_peak_param
+```{r}
+#from metadata, select label_group (sample names) and catalog numbers
+sample_meta <- meta_samp %>% select(catalog_number, label_group, block)
+#from batch2_db, select compound, Identifier, # of C
+compound_meta <- batch4_db %>% select(compound, C, Identifier, mz_db)
+#join meta with peak_apex df to create target df
+compound_targets <- peak_param_avg %>% left_join(compound_meta) %>% left_join(sample_meta) %>% 
+  #add rt.tol, mz.tol, nchannels, Z columns
+mutate(
+  rt.tol = RT_width/2.5,
+  mz.tol = 0.0075,
+  C = as.numeric(C),
+  nchannels = round((.2 * C + 1), 0),
+  Z = 1,
+  ) %>% dplyr::rename(Compound = compound, MZ = mz_db, Sample = label_group) %>% 
+  #filter out intensity < 200,000
+  filter(Intensity> 200000) %>% 
+  add_count(Compound, block) %>%
+ #filter to only include paired labeled and unlabeled blocks; filter to at least 3 pairs per treatment 
+  filter(n==2) %>% add_count(Compound, amendment) %>% filter(nn > 2) %>% select(-c(C, catalog_number, Intensity, RT_width, amendment, block, n, nn))
+
+#write to .csv
+write.csv(compound_targets, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Switchgrass_1year/targets.csv")
+```
+
+### Make Molecule File for IsoCorrectoR
+```{r}
+#make molecules file (will need to subset later)
+molecules_presubset <- batch3_db %>% select(c(Identifier, Formula, C)) %>% dplyr::rename(Molecule = Identifier) %>% mutate(Formula = paste0(Formula, "LabC", C)) %>% select(Molecule, Formula)
+
+#make key for molecules file
+key <- batch3_db %>% select(Identifier, compound)
+```
+
+### Make Element File for IsoCorrectoR
+```{r}
+elements <- batch3_db %>% select(c(C, H, N, O, S, P, Identifier)) %>% dplyr::rename(Code = Identifier)
+
+write.csv(elements, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Switchgrass_1year/elementTable.csv")
+```
+
+
+## Use ProteinTurnover to extract MIDs for lipids 
+
+### Set up list of parameters for extracting isotopic XIC 
+```{r}
+t <- list()
+
+#Set the number of cores to use. 
+t$num.cores <- 1
+
+#set data directory
+t$dir.data <- "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Switchgrass_1year" 
+
+#set results directory
+t$dir.results <-  "output/pos/Michigan_Switchgrass_1year_PT" 
+
+#set target file
+t$targetfile <- "targets.csv" 
+
+#set sample names, names of mzXML files, and names of .rds files
+t$samples <- sample
+t$rawfiles <- mzXML 
+t$rdsfiles <- rds
+
+#set isotope
+t$isotope <- "C"
+
+#Set parameter to get the relative abundance from EIC (relAbForTimes).Available options are ("lm", "rlm", "lqs", "rq", "sum","log")
+
+t$regression.model <- "lm"   # "lm" as linear regression
+```
+
+### Convert raw mzXML files to Rdata files
+This only need be done once.
+This speeds up the steps below; it can be skipped if the raw files are used in addEICs.
+```{r}
+rawToRDS(t$dir.data, t$rawfiles, t$rdsfiles)
+```
+
+### Get EICs and calculate relative abundances of isotopologues using ProteinTurnover
+```{r}
+#Read the target file.
+dat2 <- readTargetFile(t$targetfile, samples=t$samples, dir=t$dir.data)
+# Prepare the data structure for each target compound
+elementTable <- read.csv("/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Switchgrass_1year/elementTable.csv")
+
+targets <- prepTargets(dat2,
+                      isotope=t$isotope)
+# Get the EIC data for each target.
+targets <- addEICs_KRR(targets, files=t$rdsfiles, type="rds", samples=t$samples, dir=t$dir.data)
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eicdata.Rdata"))
+
+# Calculate relative abundances of each isotopic channel
+targets <- mclapply.progress(targets, function(target) {
+  relAb <- makeRelAb(target, regression.model=t$regression.model)
+  list(target=target, relAb=relAb)    
+  })
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eic_rel.Rdata"))
+```
+
+### Filter ProteinTurnover Results + Create Final Target File
+```{r}
+#Extract regression and relative abundance data from ProteinTurnover results
+out <- getResults(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "relAb", "relAb.obs", "relAb.se", "relAb.Rsq", "proportion", "compound")) 
+#order columns
+out <- out[, col_order]
+#relabel
+out_relab <- out %>% mutate(Identifier = compound, compound = NULL)
+
+#quality control filtering of relative abundance regressions
+out_relab_filter <- out_relab %>% group_by(Identifier) %>%
+#to check for coelution, make sure the relative abundance of higher isotopic channels in unlabeled samples is lower than the relative abundance of the first isotopic channel
+mutate(higher_iso_max_prop = case_when(grepl("U", Sample) & channel > 1 ~ proportion, 
+                                            TRUE ~ 0),
+       higher_iso_max_prop = max(higher_iso_max_prop),
+       lower_iso_max_prop = case_when(grepl("U", Sample) & channel <= 1 ~ proportion, 
+                                   TRUE ~ 0),
+       lower_iso_max_prop = max(lower_iso_max_prop)) %>% filter(lower_iso_max_prop * 1.1 > higher_iso_max_prop) %>% group_by(Identifier, Sample) %>%
+#r-squared of regression > 0.7
+filter(relAb.Rsq >= 0.7) %>% group_by(Identifier) %>% add_count(Sample) %>%
+#require at least 3 isotopic channels (4 channel total)
+filter(n>=4) %>% 
+#for each compound, find the max # of channels that meet r-squared filtering in all samples
+mutate(max_channels = min(n)) %>% group_by(Identifier, Sample) %>% slice(1:max_channels) %>% 
+#require monoisotopic channel to be present
+filter(min(channel) == 0) %>% ungroup()
+
+#Get metrics of relative abundance data 
+metrics <- out_relab_filter %>% ungroup() %>%
+  group_by(Sample, Identifier) %>%
+#calculate min, max, mean, and weighted mean of the relative abundance standard error and R-squared
+  dplyr::summarise(Num_channels = n(), #Scans_per_channel = max(obs), 
+                   min.relAb.se = min(relAb.se, na.rm = TRUE), 
+                   max.relAb.se = max(relAb.se, na.rm = TRUE), 
+                   mean.relAb.se = mean(relAb.se, na.rm = TRUE), 
+                   min.relAb.Rsq = min(relAb.Rsq, na.rm = TRUE), 
+                   max.relAb.Rsq = max(relAb.Rsq, na.rm = TRUE), 
+                   mean.relAb.Rsq = mean(relAb.Rsq, na.rm = TRUE)) %>%
+  ungroup() %>%
+  as.data.frame(.)
+
+#filter target list to only paired labeled and unlabeled blocks and compounds with at least 3 paired reps
+compound_targets_2 <- left_join(metrics, compound_targets) %>% mutate(Sample_split = Sample, amendment = ifelse(grepl("L", Sample), "13C_Gluc", "NA_Gluc")) %>% separate(Sample_split, sep = 1, c(NA, "block")) %>%
+#filter to only paired labeled and unlabeled samples post regression filtering
+add_count(Identifier, block) %>% filter(n==2) %>% 
+#filter to only compounds with 3 unlabeled and labeled reps
+add_count(Identifier, amendment) %>% filter(nn > 2) %>% ungroup() %>%
+#remove old nchannels column
+select(-nchannels) %>%
+#rename Num_channels to nchannels
+dplyr::rename(nchannels = Num_channels) %>%
+#select necessary columns for target file
+select(c(Compound, RT, Sample, Identifier, MZ, rt.tol, mz.tol, nchannels, Z))
+
+#write to .csv
+write.csv(compound_targets_2, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Switchgrass_1year/targets_2.csv")
+```
+
+### Rerun MID calculations
+```{r}
+#set to new target file
+t$targetfile <- "targets_2.csv" 
+
+#read target file
+dat2 <- readTargetFile(t$targetfile, samples=t$samples, dir=t$dir.data)
+
+elementTable <- read.csv("/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Switchgrass_1year/elementTable.csv")
+
+targets <- prepTargets(dat2,
+                      isotope=t$isotope)
+
+## Get the EIC data for each target.
+targets <- addEICs_KRR(targets, files=t$rdsfiles, type="rds", samples=t$samples, dir=t$dir.data)
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eicdata.Rdata"))
+
+## Calculate relative abundances of each isotopic channel
+targets <- mclapply.progress(targets, function(target) {
+  relAb <- makeRelAb(target, regression.model=t$regression.model)
+  list(target=target, relAb=relAb)    
+  })
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eic_rel.Rdata"))
+
+## HTML outputs 
+#Set up multiple cores
+if(!is.null(t$num.cores)) { options(mc.cores=t$num.cores) } 
+
+#Make html output of EICs and relative abundance regressions
+out <- makeTargetHTML(targets, dir=t$dir.results, file="results-EIC")
+```
+
+
+## Use cPIE functions to generate IsoCorrectoR input files  
+
+### Get isotopologue relative abundance data for each compound from targets object
+```{r}
+#Apply function to get and format data
+out <- getResults(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "relAb", "relAb.obs", "relAb.se", "relAb.Rsq", "proportion", "compound")) 
+#adjust column order
+out <- out[, col_order]
+#format
+out_mod <- out %>%
+  mutate(ID = Sample) %>%
+  mutate(isotopologue = as.integer(channel), area = as.numeric(relAb)) %>%
+  select(compound, isotopologue, ID, area) %>%
+  spread(key = ID, value = area, fill = NA)
+
+#write output to file 
+write.table(out, file = paste("output/pos/Michigan_Switchgrass_1year_PT/ProteinTurnover_processed_output_",format(Sys.time(), "%Y-%m-%d"),".txt", sep = ""), quote = FALSE, row.names = FALSE, sep = "\t")
+```
+
+### Extract intensity/count data from targets object 
+```{r}
+## Apply function to get and format count data
+counts <- getCounts(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "RT", "Count", "BaseCount", "use", "compound")) 
+
+counts <- counts[, c("Sample", "compound", "channel", "RT", "Count", "BaseCount", "use")]
+
+#write output to file 
+write.table(counts, file = paste("output/pos/Michigan_Switchgrass_1year_PT/ProteinTurnover_counts_",format(Sys.time(), "%Y-%m-%d"),".txt", sep = ""), quote = FALSE, row.names = FALSE, sep = "\t")
+```
+
+### Create "measurement file" for IsoCorrector
+```{r}
+out_mod <- out %>%
+  mutate(ID = Sample) %>%
+  mutate(isotopologue = as.integer(channel), area = as.numeric(relAb)) %>%
+  select(compound, isotopologue, ID, area) %>%
+  spread(key = ID, value = area, fill = NA)
+
+# write output to file
+out_mod %>%
+  unite("Measurements/Samples", compound, isotopologue, sep = "_", remove = TRUE) %>%
+  arrange(desc(UB5)) %>%
+  write.csv(., file = paste("output/pos/Michigan_Switchgrass_1year_PT/Michigan_Switchgrass_1year_pos_",format(Sys.time(), "%Y-%m-%d"),".csv", sep = ""), quote = FALSE, row.names = FALSE, na = "")
+```
+
+### Subset molecule file for IsoCorrector
+```{r, eval = FALSE}
+molecules_presubset %>%
+  semi_join(., out_mod, by = c("Molecule" = "compound")) %>% mutate(MS = "") %>%
+  setNames(c("Molecule", "MS ion or MS/MS product ion", "MS/MS neutral loss")) %>%
+  write.csv(x = ., file = "output/pos/Michigan_Switchgrass_1year_PT/Michigan_Switchgrass_1year_pos_molecule_file_subset.csv", quote = FALSE, row.names = FALSE, na = "")
+```
+
+
+## Process data through IsoCorrectoR
+```{r}
+IsoCorrection(MeasurementFile = "output/pos/Michigan_Switchgrass_1year_PT/Michigan_Switchgrass_1year_pos_2022-04-12.csv", 
+              ElementFile = "data/databases/element_file.csv", 
+              MoleculeFile = "output/pos/Michigan_Switchgrass_1year_PT/Michigan_Switchgrass_1year_pos_molecule_file_subset.csv",
+              CorrectTracerImpurity = TRUE, CorrectTracerElementCore = TRUE, 
+              CalculateMeanEnrichment = TRUE, UltraHighRes = FALSE, 
+              DirOut = 'output/pos/Michigan_Switchgrass_1year_PT', 
+              FileOut = 'result', 
+              FileOutFormat = 'csv', 
+              ReturnResultsObject = TRUE, CorrectAlsoMonoisotopic = FALSE, 
+              CalculationThreshold = 10^-10, 
+              CalculationThreshold_UHR = 8, 
+              verbose = TRUE, Testmode = FALSE)
+```
+
+
+## Combine and post-process cPIE data  
+  
+### Read and calculate spectrum intensity/count data
+```{r}
+# Aggregate various scans (indexed by retention times) to the level of compound*isotopologue (i.e., channel)
+counts_mod <- counts %>%
+  mutate(Identifier = compound, compound = NULL) %>%
+  group_by(Identifier, Sample, channel) %>%
+  dplyr::summarise(obs = n(), Total = sum(Count), check = sum(use), .groups = "keep") %>%
+  ungroup()
+```
+
+### Read in processed relative abundance (ProteinTurnover) output
+```{r PT_import}
+# Relative abundance data stored in object "out"; Use channel-specific metrics like relative abundance R-squared values for quality control.
+out_relab <- out %>% mutate(Identifier = compound, compound = NULL)
+```
+
+### Read in processed IsoCorrectoR data
+```{r isoR_data_in}
+isoR_enrich <- read.csv("output/pos/Michigan_Switchgrass_1year_PT/2022-04-12_134327/IsoCorrectoR_result_MeanEnrichment.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+
+isoR_resid <- read.csv("output/pos/Michigan_Switchgrass_1year_PT/2022-04-12_134327/IsoCorrectoR_result_Residuals.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+
+isoR_correct <- read.csv("output/pos/Michigan_Switchgrass_1year_PT/2022-04-12_134327/IsoCorrectoR_result_Corrected.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+```
+
+### Generate long-format data
+```{r long_exp}
+#Manipulate data into long format
+isoR_enrich_long <- tidyr::pivot_longer(data = isoR_enrich, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "mean.enrichment") %>% dplyr::rename(Identifier = X)
+
+#These contain channel-specific data
+isoR_resid_long <- tidyr::pivot_longer(data = isoR_resid, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "residuals") %>% 
+  dplyr::rename(Identifier = X) %>%
+  mutate(Identifier = as.character(Identifier), residuals.abs = abs(residuals)) %>%
+  separate(col = "Identifier", into = c("Identifier", "channel"), sep = "_", remove = TRUE, convert = TRUE, extra = "warn", fill = "warn")
+
+isoR_correct_long <- tidyr::pivot_longer(data = isoR_correct, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "Cor.relAb") %>%
+  dplyr::rename(Identifier = X) %>%
+  mutate(Identity = as.character(Identifier)) %>%
+  separate(col = "Identifier", into = c("Identifier", "channel"), sep = "_", remove = TRUE, convert = TRUE, extra = "warn", fill = "warn")
+```
+
+### Aggregate channel-level and compound-level data
+```{r}
+## Remember that out_relab and counts_mod contain isotopologue/channel-specific data (no longer scan-specific)
+channel_metrics <- left_join(out_relab, counts_mod, by = c("Identifier", "Sample", "channel")) %>%
+  left_join(., isoR_resid_long, by = c("Identifier", "Sample", "channel")) %>%
+  left_join(., isoR_correct_long, by = c("Identifier", "Sample", "channel"))
+```
+
+### Calculate the mean, weighted mean, max, and min values across all channels for each error metric
+```{r}
+ compound_metrics <- channel_metrics %>%
+  group_by(Sample, Identifier) %>%
+  dplyr::summarise(Num_channels = n(), Scans_per_channel = max(obs), 
+                   Intensity = sum(Total, na.rm = TRUE), 
+                   min.relAb.se = min(relAb.se, na.rm = TRUE), 
+                   max.relAb.se = max(relAb.se, na.rm = TRUE), 
+                   mean.relAb.se = mean(relAb.se, na.rm = TRUE), 
+                   wtmean.relAb.se = weighted.mean(relAb.se, Total, na.rm = TRUE), 
+                   min.relAb.Rsq = min(relAb.Rsq, na.rm = TRUE), 
+                   max.relAb.Rsq = max(relAb.Rsq, na.rm = TRUE), 
+                   mean.relAb.Rsq = mean(relAb.Rsq, na.rm = TRUE), 
+                   wtmean.relAb.Rsq = weighted.mean(relAb.Rsq, Total, na.rm = TRUE),
+                   min.residuals = min(residuals, na.rm = TRUE), 
+                   max.residuals = max(residuals, na.rm = TRUE), 
+                   mean.residuals = mean(residuals, na.rm = TRUE), 
+                   wtmean.residuals = weighted.mean(residuals, Total, na.rm = TRUE),
+                   min.residuals.abs = min(residuals.abs, na.rm = TRUE), 
+                   max.residuals.abs = max(residuals.abs, na.rm = TRUE), 
+                   mean.residuals.abs = mean(residuals.abs, na.rm = TRUE), 
+                   wtmean.residuals.abs = weighted.mean(residuals.abs, Total, na.rm = TRUE), 
+                   Total.Cor.relAb = sum(Cor.relAb, na.rm = TRUE),
+                   Total.Obs.relAb = sum(relAb, na.rm = TRUE), .groups = "keep") %>%
+  ungroup() %>%
+  mutate(TotalResidual = as.numeric(Total.Cor.relAb/Total.Obs.relAb)) %>%
+  mutate(TotalResidual.log = ifelse(TotalResidual == 0, NA, log10(TotalResidual))) %>% ## check for zeroes so don't produce -Inf
+  as.data.frame(.)
+```
+
+### Join compound-aggregated error estimates with mean.enrichment output  
+```{r}
+compounds_metrics_enrich <- isoR_enrich_long %>%
+  left_join(compound_metrics, ., by = c("Identifier", "Sample")) %>%
+#join with key to get compound names
+left_join(key) %>%
+#add column "Label" to indicate labeling treatment (unlabeled vs labeled) and "Rep" with the rep #
+mutate(Sample_category = "Michigan_Switchgrass_1year", Label = ifelse(grepl("L", Sample), "labeled", "unlabeled"), Rep = regmatches(Sample, gregexpr("[[:digit:]]+", Sample)), Rep = as.numeric(Rep))
+
+saveRDS(compounds_metrics_enrich, "output/pos/Michigan_Switchgrass_1year_PT/compounds_metrics_enrich.RDS")
+```
+
+### Calculate paired rep (labeled vs unlabeled) relative mean enrichment & implement paired t-test with Cohen's D 
+```{r}
+#paired t-test
+t_test <- compounds_metrics_enrich %>% 
+  group_by(Sample_category, Identifier, compound) %>%
+  t_test(mean.enrichment ~ Label, paired = TRUE, detailed = TRUE) %>%
+  add_significance() 
+  
+#calculate effect size (Cohen's D)
+cohens_d <- compounds_metrics_enrich %>% 
+  group_by(Sample_category, Identifier, compound) %>%
+  cohens_d(mean.enrichment ~ Label, paired = TRUE)
+
+#calculate relative enrichment between unlabeled and labeled reps
+rel_enrich <- compounds_metrics_enrich %>%
+  group_by(Sample_category, Identifier, compound, Rep) %>% 
+  pivot_wider(names_from = Label, values_from = mean.enrichment) %>% 
+  summarise(labeled = dplyr::first(na.omit(labeled)),
+      unlabeled = dplyr::first(na.omit(unlabeled))) %>%
+  mutate(rel_enrichment = labeled - unlabeled) %>%
+#calculate mean + sd enrichment difference between unlabeled and labeled rep pairs
+  group_by(Sample_category, Identifier, compound) %>% 
+  summarize(mean_rel_enrichment = mean(rel_enrichment), 
+         sd_rel_enrichment = sd(rel_enrichment))
+
+#combine
+Michigan_Switchgrass_1year_pos <- left_join(t_test, cohens_d) %>% left_join(rel_enrich)
+saveRDS(Michigan_Switchgrass_1year_pos, "output/pos/Michigan_Switchgrass_1year_PT/Michigan_Switchgrass_1year_pos.RDS" )
+```
+
+### Pull out putatively enriched compounds (p < 0.05, effsize > 0.5) and plot paired boxplots
+```{r}
+#filter significant p-values and create vector of corresponding identifiers
+significant <- Michigan_Switchgrass_1year_pos %>% filter(p < 0.05 & effsize > 0.5)
+significant_vec <- significant$Identifier
+
+#plot paired boxed plots of (significant) putatively enriched compounds
+signif_paired_boxplot(significant_vec, compounds_metrics_enrich, "output/pos/Michigan_Switchgrass_1year_PT/pairedboxplots.pdf")
+```
+
+
+# Wisconsin Corn, 1 year
+
+## Prepare input files for extraction of MIDs of identified lipids using ProteinTurnover 
+
+### Create vectors of sample names, file extensions, and catalog numbers from metadata
+```{r}
+#filter metadata to just batch 3
+meta_samp <- meta %>% filter(batch == "3" & polarity == "positive") %>% filter(site == "Wisconsin" & crop == "Corn" & timepoint == "Final")
+
+#add columns to metadata
+meta_samp <- meta_samp %>% mutate(
+  #create label of labeled/unlabeled and rep (block)
+  label_group = ifelse(amendment == "13C_Gluc", "L", "U"),
+  label_group = paste0(label_group, block), 
+  #add .rds file extension
+  sample_name_rds = reader::rmv.ext(sample_name, only.known = FALSE), 
+  sample_name_rds = paste0(sample_name_rds, ".rds")
+)
+
+#create vectors of sample names, mzXML file extensions, rds file extensions, and catalog numbers
+sample <- meta_samp$label_group
+mzXML <- meta_samp$sample_name
+rds <- meta_samp$sample_name_rds 
+sample_filt <- meta_samp$catalog_number
+```
+
+### Import raw .mzXML files and execute peak-picking 
+```{r}
+#path to .mzXML files
+dda_folder = "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Corn_1year"
+#list all files inside specified folder
+mzXMLfiles_dda <- list.files(dda_folder, recursive = TRUE, full.names = TRUE, pattern = "\\.mzXML$")
+#create dataframe witg file extensions and sample names
+pd_samp <- data.frame(extension = mzXMLfiles_dda, sample_name = basename(mzXMLfiles_dda))
+#merge metadata with phenodata frame 
+pd_samp <- left_join(meta_samp, pd_samp, by = "sample_name")
+#export ordered file list
+samps <- as.vector(pd_samp$extension)
+
+#load data 
+dda_data <- readMSData(samps,  pdata = new("NAnnotatedDataFrame", pd_samp), centroided = TRUE, mode = "onDisk")
+
+#set peak-picking parameters
+cwp <- CentWaveParam(A = 4.289723e-07, ppm=1, Instrument=2, peakwidth=c(2.5, 45), snthresh = 10, noise=10000, prefilter=c(3, 100000), firstBaselineCheck = FALSE, integrate=2)
+
+#pick peaks
+dda_data_peaks <- findChromPeaks(dda_data, param = cwp)
+```
+
+### Plot up monoisotopic XICs for targets and manually adjust (if needed) the RT window for peak RT and intensity extraction
+```{r}
+#create target list for XIC plots 
+rt_targets <- LIQUID_batch3_RT_dupremov_man %>% select(-c(count, Average.Intensity)) %>% dplyr::rename(compound = Common.Name, mz_db = Exact.m.z, rt_db = Average.Apex.RT) %>% mutate(rt_window = 30) %>% ungroup()
+
+#plot
+raw_XIC_plot(rt_targets, dda_data_peaks)
+
+#manual adjustments to target list before apex RT and intensity extraction
+rt_targets_2 <- rt_targets %>% mutate(
+  #adjust rt_window for compounds manually for messy EICs
+  rt_window = case_when(
+    grepl("TG(18:1/20:3/20:4)", compound, fixed=TRUE) ~ 15,
+    grepl("TG(18:1/20:1/20:4)", compound, fixed=TRUE) ~ 15,
+    grepl("Cer(d20:0/16:0)", compound, fixed=TRUE) ~ 15,
+    grepl("DG(15:0/18:0/0:0);DG(16:0/17:0/0:0)", compound, fixed=TRUE) ~ 40,
+    TRUE ~ rt_window
+  )
+)
+```
+
+
+### Peak apex RT and intensity extraction
+```{r}
+#extract peak intensity and retention time
+peak_param <- extract_peak_param(rt_targets_2, dda_data_peaks)
+
+#convert intensity and retention time columns to class numeric for filtering
+peak_param <- peak_param %>% ungroup() %>% mutate(Intensity = as.numeric(as.character(Intensity)), RT = as.numeric(as.character(RT)), RT_width = as.numeric(as.character(RT_width)), compound = as.character(compound))
+#except for FA that vary significantly in RT, average RT; average RT_width for all
+peak_param_avg <- peak_param %>% group_by(compound) %>% mutate(
+  RT = case_when(
+    grepl("FA", compound) ~ RT,
+    TRUE ~ mean(RT, na.rm = TRUE)
+    ), 
+  RT_width = mean(RT_width, na.rm = TRUE)
+)
+```
+
+### Make ProteinTurnover target file with rt.tol from extract_peak_param
+```{r}
+#from metadata, select label_group (sample names) and catalog numbers
+sample_meta <- meta_samp %>% select(catalog_number, label_group, block)
+#from batch2_db, select compound, Identifier, # of C
+compound_meta <- batch3_db %>% select(compound, C, Identifier, mz_db)
+#join meta with peak_apex df to create target df
+compound_targets <- peak_param_avg %>% left_join(compound_meta)  %>% left_join(sample_meta) %>% 
+  #add rt.tol, mz.tol, nchannels, Z columns
+mutate(
+  rt.tol = RT_width/2.5,
+  mz.tol = 0.0075,
+  C = as.numeric(C),
+  nchannels = round((.2 * C + 1), 0),
+  Z = 1,
+  ) %>% dplyr::rename(Compound = compound, MZ = mz_db, Sample = label_group) %>% 
+  #filter out intensity < 300000
+  filter(Intensity > 300000) %>% 
+  add_count(Compound, block) %>%
+ #filter to only include paired labeled and unlabeled blocks; filter to at least 3 pairs per treatment 
+  filter(n==2) %>% add_count(Compound, amendment) %>% filter(nn > 2) %>% select(-c(C, catalog_number, Intensity, RT_width, amendment, block, n, nn))
+
+#write to .csv
+write.csv(compound_targets, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Corn_1year/targets.csv")
+```
+
+### Make Molecule File for IsoCorrectoR
+```{r}
+#make molecules file (will need to subset later)
+molecules_presubset <- batch3_db %>% select(c(Identifier, Formula, C)) %>% dplyr::rename(Molecule = Identifier) %>% mutate(Formula = paste0(Formula, "LabC", C)) %>% select(Molecule, Formula)
+
+#make key for molecules file
+key <- batch3_db %>% select(Identifier, compound)
+```
+
+### Make Element File for IsoCorrectoR
+```{r}
+elements <- batch3_db %>% select(c(C, H, N, O, S, P, Identifier)) %>% dplyr::rename(Code = Identifier)
+
+write.csv(elements, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Corn_1year/elementTable.csv")
+```
+
+
+## Use ProteinTurnover to extract MIDs for lipids 
+
+### Set up list of parameters for extracting isotopic XIC 
+```{r}
+t <- list()
+
+#Set the number of cores to use. 
+t$num.cores <- 1
+
+#set data directory
+t$dir.data <- "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Corn_1year" 
+
+#set results directory
+t$dir.results <-  "output/pos/Wisconsin_Corn_1year_PT" 
+
+#set target file
+t$targetfile <- "targets.csv" 
+
+#set sample names, names of mzXML files, and names of .rds files
+t$samples <- sample
+t$rawfiles <- mzXML 
+t$rdsfiles <- rds
+
+#set isotope
+t$isotope <- "C"
+
+#Set parameter to get the relative abundance from EIC (relAbForTimes).Available options are ("lm", "rlm", "lqs", "rq", "sum","log")
+
+t$regression.model <- "lm"   # "lm" as linear regression
+```
+
+### Convert raw mzXML files to Rdata files
+This only need be done once.
+This speeds up the steps below; it can be skipped if the raw files are used in addEICs.
+```{r}
+rawToRDS(t$dir.data, t$rawfiles, t$rdsfiles)
+```
+
+### Get EICs and calculate relative abundances of isotopologues using ProteinTurnover
+```{r}
+#Read the target file.
+dat2 <- readTargetFile(t$targetfile, samples=t$samples, dir=t$dir.data)
+# Prepare the data structure for each target compound
+elementTable <- read.csv("/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Corn_1year/elementTable.csv")
+
+targets <- prepTargets(dat2,
+                      isotope=t$isotope)
+# Get the EIC data for each target.
+targets <- addEICs_KRR(targets, files=t$rdsfiles, type="rds", samples=t$samples, dir=t$dir.data)
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eicdata.Rdata"))
+
+# Calculate relative abundances of each isotopic channel
+targets <- mclapply.progress(targets, function(target) {
+  relAb <- makeRelAb(target, regression.model=t$regression.model)
+  list(target=target, relAb=relAb)    
+  })
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eic_rel.Rdata"))
+```
+
+### Filter ProteinTurnover Results + Create Final Target File
+```{r}
+#Extract regression and relative abundance data from ProteinTurnover results
+out <- getResults(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "relAb", "relAb.obs", "relAb.se", "relAb.Rsq", "proportion", "compound")) 
+#order columns
+out <- out[, col_order]
+#relabel
+out_relab <- out %>% mutate(Identifier = compound, compound = NULL)
+
+#quality control filtering of relative abundance regressions
+out_relab_filter <- out_relab %>% group_by(Identifier) %>%
+#to check for coelution, make sure the relative abundance of higher isotopic channels in unlabeled samples is lower than the relative abundance of the first isotopic channel
+mutate(higher_iso_max_prop = case_when(grepl("U", Sample) & channel > 1 ~ proportion, 
+                                            TRUE ~ 0),
+       higher_iso_max_prop = max(higher_iso_max_prop),
+       lower_iso_max_prop = case_when(grepl("U", Sample) & channel <= 1 ~ proportion, 
+                                   TRUE ~ 0),
+       lower_iso_max_prop = max(lower_iso_max_prop)) %>% filter(lower_iso_max_prop * 1.1 > higher_iso_max_prop) %>% group_by(Identifier, Sample) %>%
+#r-squared of regression > 0.7
+filter(relAb.Rsq >= 0.7) %>% group_by(Identifier) %>% add_count(Sample) %>%
+#require at least 3 isotopic channels (4 channel total)
+filter(n>=4) %>% 
+#for each compound, find the max # of channels that meet r-squared filtering in all samples
+mutate(max_channels = min(n)) %>% group_by(Identifier, Sample) %>% slice(1:max_channels) %>% 
+#require monoisotopic channel to be present
+filter(min(channel) == 0) %>% ungroup()
+
+#Get metrics of relative abundance data 
+metrics <- out_relab_filter %>% ungroup() %>%
+  group_by(Sample, Identifier) %>%
+#calculate min, max, mean, and weighted mean of the relative abundance standard error and R-squared
+  dplyr::summarise(Num_channels = n(), #Scans_per_channel = max(obs), 
+                   min.relAb.se = min(relAb.se, na.rm = TRUE), 
+                   max.relAb.se = max(relAb.se, na.rm = TRUE), 
+                   mean.relAb.se = mean(relAb.se, na.rm = TRUE), 
+                   min.relAb.Rsq = min(relAb.Rsq, na.rm = TRUE), 
+                   max.relAb.Rsq = max(relAb.Rsq, na.rm = TRUE), 
+                   mean.relAb.Rsq = mean(relAb.Rsq, na.rm = TRUE)) %>%
+  ungroup() %>%
+  as.data.frame(.)
+
+#filter target list to only paired labeled and unlabeled blocks and compounds with at least 3 paired reps
+compound_targets_2 <- left_join(metrics, compound_targets) %>% mutate(Sample_split = Sample, amendment = ifelse(grepl("L", Sample), "13C_Gluc", "NA_Gluc")) %>% separate(Sample_split, sep = 1, c(NA, "block")) %>%
+#filter to only paired labeled and unlabeled samples post regression filtering
+add_count(Identifier, block) %>% filter(n==2) %>% 
+#filter to only compounds with 3 unlabeled and labeled reps
+add_count(Identifier, amendment) %>% filter(nn > 2) %>% ungroup() %>%
+#remove old nchannels column
+select(-nchannels) %>%
+#rename Num_channels to nchannels
+dplyr::rename(nchannels = Num_channels) %>%
+#select necessary columns for target file
+select(c(Compound, RT, Sample, Identifier, MZ, rt.tol, mz.tol, nchannels, Z))
+
+#write to .csv
+write.csv(compound_targets_2, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Corn_1year/targets_2.csv")
+```
+
+### Rerun MID calculations
+```{r}
+#set to new target file
+t$targetfile <- "targets_2.csv" 
+
+#read target file
+dat2 <- readTargetFile(t$targetfile, samples=t$samples, dir=t$dir.data)
+
+elementTable <- read.csv("/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Wisconsin_Corn_1year/elementTable.csv")
+
+targets <- prepTargets(dat2,
+                      isotope=t$isotope)
+
+## Get the EIC data for each target.
+targets <- addEICs_KRR(targets, files=t$rdsfiles, type="rds", samples=t$samples, dir=t$dir.data)
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eicdata.Rdata"))
+
+## Calculate relative abundances of each isotopic channel
+targets <- mclapply.progress(targets, function(target) {
+  relAb <- makeRelAb(target, regression.model=t$regression.model)
+  list(target=target, relAb=relAb)    
+  })
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eic_rel.Rdata"))
+
+## HTML outputs 
+#Set up multiple cores
+if(!is.null(t$num.cores)) { options(mc.cores=t$num.cores) } 
+
+#Make html output of EICs and relative abundance regressions
+out <- makeTargetHTML(targets, dir=t$dir.results, file="results-EIC")
+```
+
+
+## Use cPIE functions to generate IsoCorrectoR input files  
+
+### Get isotopologue relative abundance data for each compound from targets object
+```{r}
+#Apply function to get and format data
+out <- getResults(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "relAb", "relAb.obs", "relAb.se", "relAb.Rsq", "proportion", "compound")) 
+#adjust column order
+out <- out[, col_order]
+#format
+out_mod <- out %>%
+  mutate(ID = Sample) %>%
+  mutate(isotopologue = as.integer(channel), area = as.numeric(relAb)) %>%
+  select(compound, isotopologue, ID, area) %>%
+  spread(key = ID, value = area, fill = NA)
+
+#write output to file 
+write.table(out, file = paste("output/pos/Wisconsin_Corn_1year_PT/ProteinTurnover_processed_output_",format(Sys.time(), "%Y-%m-%d"),".txt", sep = ""), quote = FALSE, row.names = FALSE, sep = "\t")
+```
+
+### Extract intensity/count data from targets object 
+```{r}
+## Apply function to get and format count data
+counts <- getCounts(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "RT", "Count", "BaseCount", "use", "compound")) 
+
+counts <- counts[, c("Sample", "compound", "channel", "RT", "Count", "BaseCount", "use")]
+
+#write output to file 
+write.table(counts, file = paste("output/pos/Wisconsin_Corn_1year_PT/ProteinTurnover_counts_",format(Sys.time(), "%Y-%m-%d"),".txt", sep = ""), quote = FALSE, row.names = FALSE, sep = "\t")
+```
+
+### Create "measurement file" for IsoCorrector
+```{r}
+out_mod <- out %>%
+  mutate(ID = Sample) %>%
+  mutate(isotopologue = as.integer(channel), area = as.numeric(relAb)) %>%
+  select(compound, isotopologue, ID, area) %>%
+  spread(key = ID, value = area, fill = NA)
+
+# write output to file
+out_mod %>%
+  unite("Measurements/Samples", compound, isotopologue, sep = "_", remove = TRUE) %>%
+  arrange(desc(UB5)) %>%
+  write.csv(., file = paste("output/pos/Wisconsin_Corn_1year_PT/Wisconsin_Corn_1year_pos_",format(Sys.time(), "%Y-%m-%d"),".csv", sep = ""), quote = FALSE, row.names = FALSE, na = "")
+```
+
+### Subset molecule file for IsoCorrector
+```{r, eval = FALSE}
+molecules_presubset %>%
+  semi_join(., out_mod, by = c("Molecule" = "compound")) %>% mutate(MS = "") %>%
+  setNames(c("Molecule", "MS ion or MS/MS product ion", "MS/MS neutral loss")) %>%
+  write.csv(x = ., file = "output/pos/Wisconsin_Corn_1year_PT/Wisconsin_Corn_1year_pos_molecule_file_subset.csv", quote = FALSE, row.names = FALSE, na = "")
+```
+
+
+## Process data through IsoCorrectoR
+```{r}
+IsoCorrection(MeasurementFile = "output/pos/Wisconsin_Corn_1year_PT/Wisconsin_Corn_1year_pos_2022-04-12.csv", 
+              ElementFile = "data/databases/element_file.csv", 
+              MoleculeFile = "output/pos/Wisconsin_Corn_1year_PT/Wisconsin_Corn_1year_pos_molecule_file_subset.csv",
+              CorrectTracerImpurity = TRUE, CorrectTracerElementCore = TRUE, 
+              CalculateMeanEnrichment = TRUE, UltraHighRes = FALSE, 
+              DirOut = 'output/pos/Wisconsin_Corn_1year_PT', 
+              FileOut = 'result', 
+              FileOutFormat = 'csv', 
+              ReturnResultsObject = TRUE, CorrectAlsoMonoisotopic = FALSE, 
+              CalculationThreshold = 10^-10, 
+              CalculationThreshold_UHR = 8, 
+              verbose = TRUE, Testmode = FALSE)
+```
+
+
+## Combine and post-process cPIE data  
+  
+### Read and calculate spectrum intensity/count data
+```{r}
+# Aggregate various scans (indexed by retention times) to the level of compound*isotopologue (i.e., channel)
+counts_mod <- counts %>%
+  mutate(Identifier = compound, compound = NULL) %>%
+  group_by(Identifier, Sample, channel) %>%
+  dplyr::summarise(obs = n(), Total = sum(Count), check = sum(use), .groups = "keep") %>%
+  ungroup()
+```
+
+### Read in processed relative abundance (ProteinTurnover) output
+```{r PT_import}
+# Relative abundance data stored in object "out"; Use channel-specific metrics like relative abundance R-squared values for quality control.
+out_relab <- out %>% mutate(Identifier = compound, compound = NULL)
+```
+
+### Read in processed IsoCorrectoR data
+```{r isoR_data_in}
+isoR_enrich <- read.csv("output/pos/Wisconsin_Corn_1year_PT/2022-04-12_141433/IsoCorrectoR_result_MeanEnrichment.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+
+isoR_resid <- read.csv("output/pos/Wisconsin_Corn_1year_PT/2022-04-12_141433/IsoCorrectoR_result_Residuals.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+
+isoR_correct <- read.csv("output/pos/Wisconsin_Corn_1year_PT/2022-04-12_141433/IsoCorrectoR_result_Corrected.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+```
+
+### Generate long-format data
+```{r long_exp}
+#Manipulate data into long format
+isoR_enrich_long <- tidyr::pivot_longer(data = isoR_enrich, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "mean.enrichment") %>% dplyr::rename(Identifier = X)
+
+#These contain channel-specific data
+isoR_resid_long <- tidyr::pivot_longer(data = isoR_resid, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "residuals") %>% 
+  dplyr::rename(Identifier = X) %>%
+  mutate(Identifier = as.character(Identifier), residuals.abs = abs(residuals)) %>%
+  separate(col = "Identifier", into = c("Identifier", "channel"), sep = "_", remove = TRUE, convert = TRUE, extra = "warn", fill = "warn")
+
+isoR_correct_long <- tidyr::pivot_longer(data = isoR_correct, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "Cor.relAb") %>%
+  dplyr::rename(Identifier = X) %>%
+  mutate(Identity = as.character(Identifier)) %>%
+  separate(col = "Identifier", into = c("Identifier", "channel"), sep = "_", remove = TRUE, convert = TRUE, extra = "warn", fill = "warn")
+```
+
+### Aggregate channel-level and compound-level data
+```{r}
+## Remember that out_relab and counts_mod contain isotopologue/channel-specific data (no longer scan-specific)
+channel_metrics <- left_join(out_relab, counts_mod, by = c("Identifier", "Sample", "channel")) %>%
+  left_join(., isoR_resid_long, by = c("Identifier", "Sample", "channel")) %>%
+  left_join(., isoR_correct_long, by = c("Identifier", "Sample", "channel"))
+```
+
+### Calculate the mean, weighted mean, max, and min values across all channels for each error metric
+```{r}
+ compound_metrics <- channel_metrics %>%
+  group_by(Sample, Identifier) %>%
+  dplyr::summarise(Num_channels = n(), Scans_per_channel = max(obs), 
+                   Intensity = sum(Total, na.rm = TRUE), 
+                   min.relAb.se = min(relAb.se, na.rm = TRUE), 
+                   max.relAb.se = max(relAb.se, na.rm = TRUE), 
+                   mean.relAb.se = mean(relAb.se, na.rm = TRUE), 
+                   wtmean.relAb.se = weighted.mean(relAb.se, Total, na.rm = TRUE), 
+                   min.relAb.Rsq = min(relAb.Rsq, na.rm = TRUE), 
+                   max.relAb.Rsq = max(relAb.Rsq, na.rm = TRUE), 
+                   mean.relAb.Rsq = mean(relAb.Rsq, na.rm = TRUE), 
+                   wtmean.relAb.Rsq = weighted.mean(relAb.Rsq, Total, na.rm = TRUE),
+                   min.residuals = min(residuals, na.rm = TRUE), 
+                   max.residuals = max(residuals, na.rm = TRUE), 
+                   mean.residuals = mean(residuals, na.rm = TRUE), 
+                   wtmean.residuals = weighted.mean(residuals, Total, na.rm = TRUE),
+                   min.residuals.abs = min(residuals.abs, na.rm = TRUE), 
+                   max.residuals.abs = max(residuals.abs, na.rm = TRUE), 
+                   mean.residuals.abs = mean(residuals.abs, na.rm = TRUE), 
+                   wtmean.residuals.abs = weighted.mean(residuals.abs, Total, na.rm = TRUE), 
+                   Total.Cor.relAb = sum(Cor.relAb, na.rm = TRUE),
+                   Total.Obs.relAb = sum(relAb, na.rm = TRUE), .groups = "keep") %>%
+  ungroup() %>%
+  mutate(TotalResidual = as.numeric(Total.Cor.relAb/Total.Obs.relAb)) %>%
+  mutate(TotalResidual.log = ifelse(TotalResidual == 0, NA, log10(TotalResidual))) %>% ## check for zeroes so don't produce -Inf
+  as.data.frame(.)
+```
+
+### Join compound-aggregated error estimates with mean.enrichment output  
+```{r}
+compounds_metrics_enrich <- isoR_enrich_long %>%
+  left_join(compound_metrics, ., by = c("Identifier", "Sample")) %>%
+#join with key to get compound names
+left_join(key) %>%
+#add column "Label" to indicate labeling treatment (unlabeled vs labeled) and "Rep" with the rep #
+mutate(Sample_category = "Wisconsin_Corn_1year", Label = ifelse(grepl("L", Sample), "labeled", "unlabeled"), Rep = regmatches(Sample, gregexpr("[[:digit:]]+", Sample)), Rep = as.numeric(Rep))
+
+saveRDS(compounds_metrics_enrich, "output/pos/Wisconsin_Corn_1year_PT/compounds_metrics_enrich.RDS")
+```
+
+### Calculate paired rep (labeled vs unlabeled) relative mean enrichment & implement paired t-test with Cohen's D 
+```{r}
+#paired t-test
+t_test <- compounds_metrics_enrich %>% 
+  group_by(Sample_category, Identifier, compound) %>%
+  t_test(mean.enrichment ~ Label, paired = TRUE, detailed = TRUE) %>%
+  add_significance() 
+  
+#calculate effect size (Cohen's D)
+cohens_d <- compounds_metrics_enrich %>% 
+  group_by(Sample_category, Identifier, compound) %>%
+  cohens_d(mean.enrichment ~ Label, paired = TRUE)
+
+#calculate relative enrichment between unlabeled and labeled reps
+rel_enrich <- compounds_metrics_enrich %>%
+  group_by(Sample_category, Identifier, compound, Rep) %>% 
+  pivot_wider(names_from = Label, values_from = mean.enrichment) %>% 
+  summarise(labeled = dplyr::first(na.omit(labeled)),
+      unlabeled = dplyr::first(na.omit(unlabeled))) %>%
+  mutate(rel_enrichment = labeled - unlabeled) %>%
+#calculate mean + sd enrichment difference between unlabeled and labeled rep pairs
+  group_by(Sample_category, Identifier, compound) %>% 
+  summarize(mean_rel_enrichment = mean(rel_enrichment), 
+         sd_rel_enrichment = sd(rel_enrichment))
+
+#combine
+Wisconsin_Corn_1year_pos <- left_join(t_test, cohens_d) %>% left_join(rel_enrich)
+saveRDS(Wisconsin_Corn_1year_pos, "output/pos/Wisconsin_Corn_1year_PT/Wisconsin_Corn_1year_pos.RDS" )
+```
+
+### Pull out putatively enriched compounds (p < 0.05, effsize > 0.5) and plot paired boxplots
+```{r}
+#filter significant p-values and create vector of corresponding identifiers
+significant <- Wisconsin_Corn_1year_pos %>% filter(p < 0.05 & effsize > 0.5)
+significant_vec <- significant$Identifier
+
+#plot paired boxed plots of (significant) putatively enriched compounds
+signif_paired_boxplot(significant_vec, compounds_metrics_enrich, "output/pos/Wisconsin_Corn_1year_PT/pairedboxplots.pdf")
+```
+
+
+## Michigan Corn 1 Year 
+
+## Prepare input files for extraction of MIDs of identified lipids using ProteinTurnover 
+
+### Create vectors of sample names, file extensions, and catalog numbers from metadata
+```{r}
+#filter metadata to just batch 2
+meta_samp <- meta %>% filter(batch == "3" & polarity == "positive") %>% filter(site == "Michigan" & crop == "Corn" & timepoint == "Final")
+
+#add columns to metadata
+meta_samp <- meta_samp %>% mutate(
+  #create label of labeled/unlabeled and rep (block)
+  label_group = ifelse(amendment == "13C_Gluc", "L", "U"),
+  label_group = paste0(label_group, block), 
+  #add .rds file extension
+  sample_name_rds = reader::rmv.ext(sample_name, only.known = FALSE), 
+  sample_name_rds = paste0(sample_name_rds, ".rds")
+)
+
+#create vectors of sample names, mzXML file extensions, rds file extensions, and catalog numbers
+sample <- meta_samp$label_group
+mzXML <- meta_samp$sample_name
+rds <- meta_samp$sample_name_rds 
+sample_filt <- meta_samp$catalog_number
+```
+
+### Import raw .mzXML files and execute peak-picking 
+```{r}
+#path to .mzXML files
+dda_folder = "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Corn_1year"
+#list all files inside specified folder
+mzXMLfiles_dda <- list.files(dda_folder, recursive = TRUE, full.names = TRUE, pattern = "\\.mzXML$")
+#create dataframe witg file extensions and sample names
+pd_samp <- data.frame(extension = mzXMLfiles_dda, sample_name = basename(mzXMLfiles_dda))
+#merge metadata with phenodata frame 
+pd_samp <- left_join(meta_samp, pd_samp, by = "sample_name")
+#export ordered file list
+samps <- as.vector(pd_samp$extension)
+
+#load data 
+dda_data <- readMSData(samps,  pdata = new("NAnnotatedDataFrame", pd_samp), centroided = TRUE, mode = "onDisk")
+
+#set peak-picking parameters
+cwp <- CentWaveParam(A = 4.289723e-07, ppm=1, Instrument=2, peakwidth=c(2.5, 45), snthresh = 10, noise=10000, prefilter=c(3, 100000), firstBaselineCheck = FALSE, integrate=2)
+
+#pick peaks
+dda_data_peaks <- findChromPeaks(dda_data, param = cwp)
+```
+
+### Plot up monoisotopic XICs for targets and manually adjust (if needed) the RT window for peak RT and intensity extraction
+```{r}
+#create target list for XIC plots 
+rt_targets <- LIQUID_batch3_RT_dupremov_man %>% select(-c(count, Average.Intensity)) %>% dplyr::rename(compound = Common.Name, mz_db = Exact.m.z, rt_db = Average.Apex.RT) %>% mutate(rt_window = 30) %>% ungroup()
+
+#plot
+raw_XIC_plot(rt_targets, dda_data_peaks)
+
+#manual adjustments to target list before apex RT and intensity extraction
+rt_targets_2 <- rt_targets %>% mutate(
+  #adjust rt_window for compounds manually for messy EICs
+  rt_window = case_when(
+    grepl("TG(18:1/20:3/20:4)", compound, fixed=TRUE) ~ 15,
+    grepl("TG(18:1/20:1/20:4)", compound, fixed=TRUE) ~ 15,
+    grepl("Cer(d20:0/16:0)", compound, fixed=TRUE) ~ 15,
+    TRUE ~ rt_window
+  )
+)
+```
+
+
+### Peak apex RT and intensity extraction
+```{r}
+#extract peak intensity and retention time
+peak_param <- extract_peak_param(rt_targets_2, dda_data_peaks)
+
+#convert intensity and retention time columns to class numeric for filtering
+peak_param <- peak_param %>% ungroup() %>% mutate(Intensity = as.numeric(as.character(Intensity)), RT = as.numeric(as.character(RT)), RT_width = as.numeric(as.character(RT_width)), compound = as.character(compound))
+#except for FA that vary significantly in RT, average RT; average RT_width for all
+peak_param_avg <- peak_param %>% group_by(compound) %>% mutate(
+  RT = case_when(
+    grepl("FA", compound) ~ RT,
+    TRUE ~ mean(RT, na.rm = TRUE)
+    ), 
+  RT_width = mean(RT_width, na.rm = TRUE)
+)
+```
+
+### Make ProteinTurnover target file with rt.tol from extract_peak_param
+```{r}
+#from metadata, select label_group (sample names) and catalog numbers
+sample_meta <- meta_samp %>% select(catalog_number, label_group, block)
+#from batch2_db, select compound, Identifier, # of C
+compound_meta <- batch4_db %>% select(compound, C, Identifier, mz_db)
+#join meta with peak_apex df to create target df
+compound_targets <- peak_param_avg %>% left_join(compound_meta) %>% left_join(sample_meta) %>% 
+  #add rt.tol, mz.tol, nchannels, Z columns
+mutate(
+  rt.tol = RT_width/2.5,
+  mz.tol = 0.0075,
+  C = as.numeric(C),
+  nchannels = round((.2 * C + 1), 0),
+  Z = 1,
+  ) %>% dplyr::rename(Compound = compound, MZ = mz_db, Sample = label_group) %>% 
+  #filter out intensity < 200,000
+  filter(Intensity> 200000) %>% 
+  add_count(Compound, block) %>%
+ #filter to only include paired labeled and unlabeled blocks; filter to at least 3 pairs per treatment 
+  filter(n==2) %>% add_count(Compound, amendment) %>% filter(nn > 2) %>% select(-c(C, catalog_number, Intensity, RT_width, amendment, block, n, nn))
+
+#write to .csv
+write.csv(compound_targets, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Corn_1year/targets.csv")
+```
+
+### Make Molecule File for IsoCorrectoR
+```{r}
+#make molecules file (will need to subset later)
+molecules_presubset <- batch3_db %>% select(c(Identifier, Formula, C)) %>% dplyr::rename(Molecule = Identifier) %>% mutate(Formula = paste0(Formula, "LabC", C)) %>% select(Molecule, Formula)
+
+#make key for molecules file
+key <- batch3_db %>% select(Identifier, compound)
+```
+
+### Make Element File for IsoCorrectoR
+```{r}
+elements <- batch3_db %>% select(c(C, H, N, O, S, P, Identifier)) %>% dplyr::rename(Code = Identifier)
+
+write.csv(elements, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Corn_1year/elementTable.csv")
+```
+
+
+## Use ProteinTurnover to extract MIDs for lipids 
+
+### Set up list of parameters for extracting isotopic XIC 
+```{r}
+t <- list()
+
+#Set the number of cores to use. 
+t$num.cores <- 1
+
+#set data directory
+t$dir.data <- "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Corn_1year" 
+
+#set results directory
+t$dir.results <-  "output/pos/Michigan_Corn_1year_PT" 
+
+#set target file
+t$targetfile <- "targets.csv" 
+
+#set sample names, names of mzXML files, and names of .rds files
+t$samples <- sample
+t$rawfiles <- mzXML 
+t$rdsfiles <- rds
+
+#set isotope
+t$isotope <- "C"
+
+#Set parameter to get the relative abundance from EIC (relAbForTimes).Available options are ("lm", "rlm", "lqs", "rq", "sum","log")
+
+t$regression.model <- "lm"   # "lm" as linear regression
+```
+
+### Convert raw mzXML files to Rdata files
+This only need be done once.
+This speeds up the steps below; it can be skipped if the raw files are used in addEICs.
+```{r}
+rawToRDS(t$dir.data, t$rawfiles, t$rdsfiles)
+```
+
+### Get EICs and calculate relative abundances of isotopologues using ProteinTurnover
+```{r}
+#Read the target file.
+dat2 <- readTargetFile(t$targetfile, samples=t$samples, dir=t$dir.data)
+# Prepare the data structure for each target compound
+elementTable <- read.csv("/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Corn_1year/elementTable.csv")
+
+targets <- prepTargets(dat2,
+                      isotope=t$isotope)
+# Get the EIC data for each target.
+targets <- addEICs_KRR(targets, files=t$rdsfiles, type="rds", samples=t$samples, dir=t$dir.data)
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eicdata.Rdata"))
+
+# Calculate relative abundances of each isotopic channel
+targets <- mclapply.progress(targets, function(target) {
+  relAb <- makeRelAb(target, regression.model=t$regression.model)
+  list(target=target, relAb=relAb)    
+  })
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eic_rel.Rdata"))
+```
+
+### Filter ProteinTurnover Results + Create Final Target File
+```{r}
+#Extract regression and relative abundance data from ProteinTurnover results
+out <- getResults(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "relAb", "relAb.obs", "relAb.se", "relAb.Rsq", "proportion", "compound")) 
+#order columns
+out <- out[, col_order]
+#relabel
+out_relab <- out %>% mutate(Identifier = compound, compound = NULL)
+
+#quality control filtering of relative abundance regressions
+out_relab_filter <- out_relab %>% group_by(Identifier) %>%
+#to check for coelution, make sure the relative abundance of higher isotopic channels in unlabeled samples is lower than the relative abundance of the first isotopic channel
+mutate(higher_iso_max_prop = case_when(grepl("U", Sample) & channel > 1 ~ proportion, 
+                                            TRUE ~ 0),
+       higher_iso_max_prop = max(higher_iso_max_prop),
+       lower_iso_max_prop = case_when(grepl("U", Sample) & channel <= 1 ~ proportion, 
+                                   TRUE ~ 0),
+       lower_iso_max_prop = max(lower_iso_max_prop)) %>% filter(lower_iso_max_prop * 1.1 > higher_iso_max_prop) %>% group_by(Identifier, Sample) %>%
+#r-squared of regression > 0.7
+filter(relAb.Rsq >= 0.7) %>% group_by(Identifier) %>% add_count(Sample) %>%
+#require at least 3 isotopic channels (4 channel total)
+filter(n>=4) %>% 
+#for each compound, find the max # of channels that meet r-squared filtering in all samples
+mutate(max_channels = min(n)) %>% group_by(Identifier, Sample) %>% slice(1:max_channels) %>% 
+#require monoisotopic channel to be present
+filter(min(channel) == 0) %>% ungroup()
+
+#Get metrics of relative abundance data 
+metrics <- out_relab_filter %>% ungroup() %>%
+  group_by(Sample, Identifier) %>%
+#calculate min, max, mean, and weighted mean of the relative abundance standard error and R-squared
+  dplyr::summarise(Num_channels = n(), #Scans_per_channel = max(obs), 
+                   min.relAb.se = min(relAb.se, na.rm = TRUE), 
+                   max.relAb.se = max(relAb.se, na.rm = TRUE), 
+                   mean.relAb.se = mean(relAb.se, na.rm = TRUE), 
+                   min.relAb.Rsq = min(relAb.Rsq, na.rm = TRUE), 
+                   max.relAb.Rsq = max(relAb.Rsq, na.rm = TRUE), 
+                   mean.relAb.Rsq = mean(relAb.Rsq, na.rm = TRUE)) %>%
+  ungroup() %>%
+  as.data.frame(.)
+
+#filter target list to only paired labeled and unlabeled blocks and compounds with at least 3 paired reps
+compound_targets_2 <- left_join(metrics, compound_targets) %>% mutate(Sample_split = Sample, amendment = ifelse(grepl("L", Sample), "13C_Gluc", "NA_Gluc")) %>% separate(Sample_split, sep = 1, c(NA, "block")) %>%
+#filter to only paired labeled and unlabeled samples post regression filtering
+add_count(Identifier, block) %>% filter(n==2) %>% 
+#filter to only compounds with 3 unlabeled and labeled reps
+add_count(Identifier, amendment) %>% filter(nn > 2) %>% ungroup() %>%
+#remove old nchannels column
+select(-nchannels) %>%
+#rename Num_channels to nchannels
+dplyr::rename(nchannels = Num_channels) %>%
+#select necessary columns for target file
+select(c(Compound, RT, Sample, Identifier, MZ, rt.tol, mz.tol, nchannels, Z))
+
+#write to .csv
+write.csv(compound_targets_2, "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Corn_1year/targets_2.csv")
+```
+
+### Rerun MID calculations
+```{r}
+#set to new target file
+t$targetfile <- "targets_2.csv" 
+
+#read target file
+dat2 <- readTargetFile(t$targetfile, samples=t$samples, dir=t$dir.data)
+
+elementTable <- read.csv("/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/positive/Michigan_Corn_1year/elementTable.csv")
+
+targets <- prepTargets(dat2,
+                      isotope=t$isotope)
+
+## Get the EIC data for each target.
+targets <- addEICs_KRR(targets, files=t$rdsfiles, type="rds", samples=t$samples, dir=t$dir.data)
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eicdata.Rdata"))
+
+## Calculate relative abundances of each isotopic channel
+targets <- mclapply.progress(targets, function(target) {
+  relAb <- makeRelAb(target, regression.model=t$regression.model)
+  list(target=target, relAb=relAb)    
+  })
+
+save(dat2, targets, t, file=file.path(t$dir.results, "eic_rel.Rdata"))
+
+## HTML outputs 
+#Set up multiple cores
+if(!is.null(t$num.cores)) { options(mc.cores=t$num.cores) } 
+
+#Make html output of EICs and relative abundance regressions
+out <- makeTargetHTML(targets, dir=t$dir.results, file="results-EIC")
+```
+
+
+## Use cPIE functions to generate IsoCorrectoR input files  
+
+### Get isotopologue relative abundance data for each compound from targets object
+```{r}
+#Apply function to get and format data
+out <- getResults(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "relAb", "relAb.obs", "relAb.se", "relAb.Rsq", "proportion", "compound")) 
+#adjust column order
+out <- out[, col_order]
+#format
+out_mod <- out %>%
+  mutate(ID = Sample) %>%
+  mutate(isotopologue = as.integer(channel), area = as.numeric(relAb)) %>%
+  select(compound, isotopologue, ID, area) %>%
+  spread(key = ID, value = area, fill = NA)
+
+#write output to file 
+write.table(out, file = paste("output/pos/Michigan_Corn_1year_PT/ProteinTurnover_processed_output_",format(Sys.time(), "%Y-%m-%d"),".txt", sep = ""), quote = FALSE, row.names = FALSE, sep = "\t")
+```
+
+### Extract intensity/count data from targets object 
+```{r}
+## Apply function to get and format count data
+counts <- getCounts(targets) %>%
+  bind_rows() %>%
+  setNames(c("Sample", "channel", "RT", "Count", "BaseCount", "use", "compound")) 
+
+counts <- counts[, c("Sample", "compound", "channel", "RT", "Count", "BaseCount", "use")]
+
+#write output to file 
+write.table(counts, file = paste("output/pos/Michigan_Corn_1year_PT/ProteinTurnover_counts_",format(Sys.time(), "%Y-%m-%d"),".txt", sep = ""), quote = FALSE, row.names = FALSE, sep = "\t")
+```
+
+### Create "measurement file" for IsoCorrector
+```{r}
+out_mod <- out %>%
+  mutate(ID = Sample) %>%
+  mutate(isotopologue = as.integer(channel), area = as.numeric(relAb)) %>%
+  select(compound, isotopologue, ID, area) %>%
+  spread(key = ID, value = area, fill = NA)
+
+# write output to file
+out_mod %>%
+  unite("Measurements/Samples", compound, isotopologue, sep = "_", remove = TRUE) %>%
+  arrange(desc(UB5)) %>%
+  write.csv(., file = paste("output/pos/Michigan_Corn_1year_PT/Michigan_Corn_1year_pos_",format(Sys.time(), "%Y-%m-%d"),".csv", sep = ""), quote = FALSE, row.names = FALSE, na = "")
+```
+
+### Subset molecule file for IsoCorrector
+```{r, eval = FALSE}
+molecules_presubset %>%
+  semi_join(., out_mod, by = c("Molecule" = "compound")) %>% mutate(MS = "") %>%
+  setNames(c("Molecule", "MS ion or MS/MS product ion", "MS/MS neutral loss")) %>%
+  write.csv(x = ., file = "output/pos/Michigan_Corn_1year_PT/Michigan_Corn_1year_pos_molecule_file_subset.csv", quote = FALSE, row.names = FALSE, na = "")
+```
+
+
+## Process data through IsoCorrectoR
+```{r}
+IsoCorrection(MeasurementFile = "output/pos/Michigan_Corn_1year_PT/Michigan_Corn_1year_pos_2022-04-12.csv", 
+              ElementFile = "data/databases/element_file.csv", 
+              MoleculeFile = "output/pos/Michigan_Corn_1year_PT/Michigan_Corn_1year_pos_molecule_file_subset.csv",
+              CorrectTracerImpurity = TRUE, CorrectTracerElementCore = TRUE, 
+              CalculateMeanEnrichment = TRUE, UltraHighRes = FALSE, 
+              DirOut = 'output/pos/Michigan_Corn_1year_PT', 
+              FileOut = 'result', 
+              FileOutFormat = 'csv', 
+              ReturnResultsObject = TRUE, CorrectAlsoMonoisotopic = FALSE, 
+              CalculationThreshold = 10^-10, 
+              CalculationThreshold_UHR = 8, 
+              verbose = TRUE, Testmode = FALSE)
+```
+
+
+## Combine and post-process cPIE data  
+  
+### Read and calculate spectrum intensity/count data
+```{r}
+# Aggregate various scans (indexed by retention times) to the level of compound*isotopologue (i.e., channel)
+counts_mod <- counts %>%
+  mutate(Identifier = compound, compound = NULL) %>%
+  group_by(Identifier, Sample, channel) %>%
+  dplyr::summarise(obs = n(), Total = sum(Count), check = sum(use), .groups = "keep") %>%
+  ungroup()
+```
+
+### Read in processed relative abundance (ProteinTurnover) output
+```{r PT_import}
+# Relative abundance data stored in object "out"; Use channel-specific metrics like relative abundance R-squared values for quality control.
+out_relab <- out %>% mutate(Identifier = compound, compound = NULL)
+```
+
+### Read in processed IsoCorrectoR data
+```{r isoR_data_in}
+isoR_enrich <- read.csv("output/pos/Michigan_Corn_1year_PT/2022-04-12_143708/IsoCorrectoR_result_MeanEnrichment.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+
+isoR_resid <- read.csv("output/pos/Michigan_Corn_1year_PT/2022-04-12_143708/IsoCorrectoR_result_Residuals.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+
+isoR_correct <- read.csv("output/pos/Michigan_Corn_1year_PT/2022-04-12_143708/IsoCorrectoR_result_Corrected.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+```
+
+### Generate long-format data
+```{r long_exp}
+#Manipulate data into long format
+isoR_enrich_long <- tidyr::pivot_longer(data = isoR_enrich, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "mean.enrichment") %>% dplyr::rename(Identifier = X)
+
+#These contain channel-specific data
+isoR_resid_long <- tidyr::pivot_longer(data = isoR_resid, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "residuals") %>% 
+  dplyr::rename(Identifier = X) %>%
+  mutate(Identifier = as.character(Identifier), residuals.abs = abs(residuals)) %>%
+  separate(col = "Identifier", into = c("Identifier", "channel"), sep = "_", remove = TRUE, convert = TRUE, extra = "warn", fill = "warn")
+
+isoR_correct_long <- tidyr::pivot_longer(data = isoR_correct, cols = starts_with("LB") | starts_with("UB"), names_to = "Sample", values_to = "Cor.relAb") %>%
+  dplyr::rename(Identifier = X) %>%
+  mutate(Identity = as.character(Identifier)) %>%
+  separate(col = "Identifier", into = c("Identifier", "channel"), sep = "_", remove = TRUE, convert = TRUE, extra = "warn", fill = "warn")
+```
+
+### Aggregate channel-level and compound-level data
+```{r}
+## Remember that out_relab and counts_mod contain isotopologue/channel-specific data (no longer scan-specific)
+channel_metrics <- left_join(out_relab, counts_mod, by = c("Identifier", "Sample", "channel")) %>%
+  left_join(., isoR_resid_long, by = c("Identifier", "Sample", "channel")) %>%
+  left_join(., isoR_correct_long, by = c("Identifier", "Sample", "channel"))
+```
+
+### Calculate the mean, weighted mean, max, and min values across all channels for each error metric
+```{r}
+ compound_metrics <- channel_metrics %>%
+  group_by(Sample, Identifier) %>%
+  dplyr::summarise(Num_channels = n(), Scans_per_channel = max(obs), 
+                   Intensity = sum(Total, na.rm = TRUE), 
+                   min.relAb.se = min(relAb.se, na.rm = TRUE), 
+                   max.relAb.se = max(relAb.se, na.rm = TRUE), 
+                   mean.relAb.se = mean(relAb.se, na.rm = TRUE), 
+                   wtmean.relAb.se = weighted.mean(relAb.se, Total, na.rm = TRUE), 
+                   min.relAb.Rsq = min(relAb.Rsq, na.rm = TRUE), 
+                   max.relAb.Rsq = max(relAb.Rsq, na.rm = TRUE), 
+                   mean.relAb.Rsq = mean(relAb.Rsq, na.rm = TRUE), 
+                   wtmean.relAb.Rsq = weighted.mean(relAb.Rsq, Total, na.rm = TRUE),
+                   min.residuals = min(residuals, na.rm = TRUE), 
+                   max.residuals = max(residuals, na.rm = TRUE), 
+                   mean.residuals = mean(residuals, na.rm = TRUE), 
+                   wtmean.residuals = weighted.mean(residuals, Total, na.rm = TRUE),
+                   min.residuals.abs = min(residuals.abs, na.rm = TRUE), 
+                   max.residuals.abs = max(residuals.abs, na.rm = TRUE), 
+                   mean.residuals.abs = mean(residuals.abs, na.rm = TRUE), 
+                   wtmean.residuals.abs = weighted.mean(residuals.abs, Total, na.rm = TRUE), 
+                   Total.Cor.relAb = sum(Cor.relAb, na.rm = TRUE),
+                   Total.Obs.relAb = sum(relAb, na.rm = TRUE), .groups = "keep") %>%
+  ungroup() %>%
+  mutate(TotalResidual = as.numeric(Total.Cor.relAb/Total.Obs.relAb)) %>%
+  mutate(TotalResidual.log = ifelse(TotalResidual == 0, NA, log10(TotalResidual))) %>% ## check for zeroes so don't produce -Inf
+  as.data.frame(.)
+```
+
+### Join compound-aggregated error estimates with mean.enrichment output  
+```{r}
+compounds_metrics_enrich <- isoR_enrich_long %>%
+  left_join(compound_metrics, ., by = c("Identifier", "Sample")) %>%
+#join with key to get compound names
+left_join(key) %>%
+#add column "Label" to indicate labeling treatment (unlabeled vs labeled) and "Rep" with the rep #
+mutate(Sample_category = "Michigan_Corn_1year", Label = ifelse(grepl("L", Sample), "labeled", "unlabeled"), Rep = regmatches(Sample, gregexpr("[[:digit:]]+", Sample)), Rep = as.numeric(Rep))
+
+saveRDS(compounds_metrics_enrich, "output/pos/Michigan_Corn_1year_PT/compounds_metrics_enrich.RDS")
+```
+
+### Calculate paired rep (labeled vs unlabeled) relative mean enrichment & implement paired t-test with Cohen's D 
+```{r}
+#paired t-test
+t_test <- compounds_metrics_enrich %>% 
+  group_by(Sample_category, Identifier, compound) %>%
+  t_test(mean.enrichment ~ Label, paired = TRUE, detailed = TRUE) %>%
+  add_significance() 
+  
+#calculate effect size (Cohen's D)
+cohens_d <- compounds_metrics_enrich %>% 
+  group_by(Sample_category, Identifier, compound) %>%
+  cohens_d(mean.enrichment ~ Label, paired = TRUE)
+
+#calculate relative enrichment between unlabeled and labeled reps
+rel_enrich <- compounds_metrics_enrich %>%
+  group_by(Sample_category, Identifier, compound, Rep) %>% 
+  pivot_wider(names_from = Label, values_from = mean.enrichment) %>% 
+  summarise(labeled = dplyr::first(na.omit(labeled)),
+      unlabeled = dplyr::first(na.omit(unlabeled))) %>%
+  mutate(rel_enrichment = labeled - unlabeled) %>%
+#calculate mean + sd enrichment difference between unlabeled and labeled rep pairs
+  group_by(Sample_category, Identifier, compound) %>% 
+  summarize(mean_rel_enrichment = mean(rel_enrichment), 
+         sd_rel_enrichment = sd(rel_enrichment))
+
+#combine
+Michigan_Corn_1year_pos <- left_join(t_test, cohens_d) %>% left_join(rel_enrich)
+saveRDS(Michigan_Corn_1year_pos, "output/pos/Michigan_Corn_1year_PT/Michigan_Corn_1year_pos.RDS" )
+```
+
+### Pull out putatively enriched compounds (p < 0.05, effsize > 0.5) and plot paired boxplots
+```{r}
+#filter significant p-values and create vector of corresponding identifiers
+significant <- Michigan_Corn_1year_pos %>% filter(p < 0.05 & effsize > 0.5)
+significant_vec <- significant$Identifier
+
+#plot paired boxed plots of (significant) putatively enriched compounds
+signif_paired_boxplot(significant_vec, compounds_metrics_enrich, "output/pos/Michigan_Corn_1year_PT/pairedboxplots.pdf")
+```
+
+
+
+## Combine Data 
+```{r}
+batch3 <- rbind(Wisconsin_Switchgrass_2month_pos, Michigan_Switchgrass_2month_pos, Michigan_Switchgrass_1year_pos, Wisconsin_Switchgrass_1year_pos, Wisconsin_Corn_1year_pos, Michigan_Corn_1year_pos)
+
+test <- batch3 %>% select(c(Sample_category, mean_rel_enrichment, compound)) %>% pivot_wider(names_from = Sample_category, values_from = mean_rel_enrichment)
+
+saveRDS(test, "output/pos/test_batch3.rds")
+saveRDS(batch3, "output/pos/batch3.rds")
+```
+
+

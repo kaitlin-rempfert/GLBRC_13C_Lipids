@@ -1,0 +1,369 @@
+---
+title: "IPL barplots"
+output: html_document
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r setup, echo = TRUE, message=FALSE, warning=FALSE}
+# clear workspace
+# WS = c(ls())
+# rm(WS, list = WS)
+
+# load required packages
+library(tidyverse)
+library(Rodin)
+library(ggplot2)
+library(vegan)
+library(phyloseq)
+library(ggvegan)
+library(knitr)
+library(readxl)
+library(metagenomeSeq)
+library(hilldiv)
+library(microViz)
+library(Rodin)
+
+knitr::opts_chunk$set(echo = TRUE, cache = F)
+```
+
+
+# Import Data
+```{r}
+#read in abundance data from pmartR
+mylipidData <- readRDS("output/pmartR/mylipidData.rds")
+
+#read ionization responses in for Equisplash standards
+Equisplash_rel_response <- readRDS("output/Equisplash_rel_response.rds")
+
+#import metadata file 
+meta <- readxl::read_excel("incubation_metadata_w_qc.xlsx")
+```
+
+
+# Intact Lipids
+
+# Pull out data from LipidObject
+```{r}
+#pull out e and f data and e-meta 
+lipid_e <- mylipidData[["e_data"]]
+lipid_f <- mylipidData[["f_data"]]
+lipid_meta <- mylipidData[["e_meta"]]
+
+#pull out catalog names in f_data and for now filter to switchgrass samples
+lipid_f <- lipid_f %>% filter(group != "qc") %>% rowwise() %>% dplyr::mutate(catalog_number = strsplit(sample_name, split="_")[[1]][1]) %>% mutate(type = "IPL") %>% filter(crop == "Switchgrass") 
+
+#reformat e-data
+lipidomics_samples <- lipid_e  %>% mutate(Compound = str_remove_all(Compound, "mylipidData_neg_")) %>% column_to_rownames("Compound") %>% t() %>% as.data.frame() %>% rownames_to_column("catalog_name") %>% rowwise() %>%
+dplyr::mutate(catalog_number = strsplit(catalog_name, split="_")[[1]][1]) %>% filter(!grepl("QC", catalog_name)) %>% select(-catalog_name) %>% column_to_rownames("catalog_number") %>% t() %>% as.data.frame() %>% rownames_to_column("Compound")
+
+#add classification data from Rodin
+targets <- lipid_meta %>%  dplyr::rename("Lipid" = "Compound") %>% mutate(Lipid = str_remove_all(Lipid, "mylipidData_neg_"))
+#Query <- targets$Lipid
+#for lipid isomers separated by ";", split into separate rows
+targets_subset <- targets %>% filter(grepl(";", Lipid, fixed = TRUE))
+out <- do.call(rbind, Map(cbind, strsplit(targets_subset$Lipid, ";"), targets_subset$mz_db, targets_subset$rt_db)) %>% as.data.frame() %>% dplyr::rename("mz_db" = "V2", "Lipid_sep" = "V1", "rt_db" = "V3") %>% mutate(mz_db = as.numeric(mz_db), rt_db = as.numeric(rt_db))
+#rejoin subsetted lipids with lipids in target list
+targets_subsetted <- left_join(targets, out) %>% mutate(Lipid_sep = case_when(
+  is.na(Lipid_sep) ~ Lipid,
+  TRUE ~ Lipid_sep
+))
+#pull out lipid names from target list for querying
+targets_subsetted_query <- targets_subsetted %>% select(Lipid_sep) %>% distinct()
+Query <- targets_subsetted_query$Lipid_sep
+#clean query list
+#cleaned.query <- clean.lipid.list(Query)
+
+#mine
+lipid.miner(Query, name="Query", TGcollapse.rm = TRUE)
+meta_rodin <- left_join(targets_subsetted, Query.intact, by = c("Lipid_sep" = "Lipid")) 
+meta_rodin_sep <- meta_rodin %>% select(-c(Lipid, rt_db)) %>%
+distinct()
+
+
+meta_rodin_taxonomy <- meta_rodin_sep %>% mutate(Lipid_subclass = case_when(
+  `Main class` == "Cer" ~ "Cer",
+  `Main class` == "DG" ~ "DG",
+   grepl("DGTSA", Lipid_sep) ~ "DGTSA",
+  `Main class` == "PC" ~ "PC",
+  `Main class` == "PG" ~ "PG",
+  `Main class` == "PE" ~ "PE",
+  `Main class` == "PI" ~ "PI",
+  grepl("FA", Lipid_sep) ~ "FA",
+  grepl("Hydroxy", Lipid_sep) ~ "HA",
+  `Main class` == "TG" ~ "TG",
+  TRUE ~ "Other"
+),
+N_Chain = case_when(
+  grepl("LPC", `Sub class`) ~ 1,
+  grepl("LPE", `Sub class`) ~ 1,
+  grepl("LPG", `Sub class`) ~ 1,
+  grepl("DG", Lipid_sep) ~ 2,
+  grepl("TG", Lipid_sep) ~ 3,
+  grepl("PC(", `Sub class`, fixed = TRUE) ~ 2, 
+  grepl("PE", Lipid_sep) ~ 2, 
+  grepl("PG", Lipid_sep) ~ 2, 
+  grepl("PI", Lipid_sep) ~ 2, 
+  grepl("Cer", `Sub class`) ~ 2,
+  grepl("FA", Lipid_sep) ~ 1,
+  grepl("Hydroxy", Lipid_sep) ~ 1,
+  TRUE ~ 1),
+avg_chain_C = `Total Number of Carbon`/N_Chain,
+avg_chain_DBE = `Double Bonds`/N_Chain)
+
+
+#account for isomers
+#remove log2 transformation 
+lipidomics_samples[2:40] <- 2^lipidomics_samples[2:40]
+#count number of compounds per compound ID
+lipidomics_samples_sep <- left_join(lipidomics_samples, targets_subsetted %>% select(c(Lipid, Lipid_sep)), by = c("Compound" = "Lipid")) %>% ungroup() 
+lipidomics_samples_sep <- lipidomics_samples_sep %>% mutate(n_compounds = stringi::stri_count_fixed(lipidomics_samples_sep$Compound, ";")) %>%
+#convert number to multiplier for intensity
+mutate(
+  multiplier = n_compounds + 1
+) %>% 
+#apply multiplier
+mutate_at(vars(starts_with("EC")), ~.*1/multiplier) %>%
+select(-c(multiplier, multiplier, n_compounds)) %>%
+#reconvert to log2 scale
+mutate_at(vars(starts_with("EC")), log2) %>%
+#combine lipids with multiple entries
+group_by(Lipid_sep) %>% 
+mutate_at(vars(starts_with("EC")), sum) %>% distinct()
+
+#account for ionization efficiency 
+#add class data 
+meta_rodin_response <- meta_rodin_taxonomy %>% mutate(response_class = case_when(
+  grepl("LPC", `Sub class`) ~ "LPC",
+  grepl("LPE", `Sub class`) ~ "LPE",
+  grepl("LPG", `Sub class`) ~ "LPE",
+  grepl("DG", Lipid_sep) ~ "DG",
+  grepl("TG", Lipid_sep) ~ "TG",
+  grepl("PC(", `Sub class`, fixed = TRUE) ~ "PC", 
+  grepl("PE", Lipid_sep) ~ "PE", 
+  grepl("PG", Lipid_sep) ~ "PG", 
+  grepl("PI", Lipid_sep) ~ "PI", 
+  grepl("Cer", `Sub class`) ~ "Cer",
+  grepl("FA", Lipid_sep) ~ "MG",
+  grepl("Hydroxy", Lipid_sep) ~ "MG",
+  TRUE ~ "TG"
+))
+
+#join with ionization efficiency 
+rel_responses <- left_join(meta_rodin_response, Equisplash_rel_response, by = c("response_class" = "Class")) %>% select(c(Lipid_sep, relative_response))
+
+#join with log2 abundance data 
+lipidomics_samples_sep_corrected <- left_join(lipidomics_samples_sep, rel_responses) %>%
+#apply response factor
+mutate_at(vars(starts_with("EC")), ~.*1/relative_response) %>%
+select(-relative_response) 
+
+#saveRDS(lipidomics_samples_sep_corrected, "output/lipidomics_samples_sep_corrected.RDS")
+```
+
+
+# Filter by has enrichment data and significant enrichment 
+```{r}
+combined_SIP <- readRDS("output/combined_SIP_4_23.RDS")
+
+uniq_sig_intact <- combined_SIP %>% filter(p.signif != "ns") %>% select(Compound) %>% distinct() 
+uniq_sig_intact_vec <- uniq_sig_intact$Compound
+
+enrich_data_intact <- combined_SIP %>%  select(Compound) %>% distinct() 
+enrich_data_intact_vec <- enrich_data_intact$Compound
+
+lipidomics_samples_sep_corrected_labeled <- lipidomics_samples_sep_corrected %>% filter(Compound %in% uniq_sig_intact_vec) %>% rename_at(vars(starts_with('EC')), ~paste0(., "_labeled"))
+
+lipidomics_samples_sep_corrected_with_enrichment_data <- lipidomics_samples_sep_corrected %>% filter(Compound %in% enrich_data_intact_vec) %>% rename_at(vars(starts_with('EC')), ~paste0(., "_with_enrichment_data"))
+```
+
+
+## combine with all lipids
+```{r}
+lipidomics_samples_sep_corrected <- lipidomics_samples_sep_corrected %>% rename_at(vars(starts_with('EC')), ~paste0(., "_identified"))
+
+lipidomics_samples_sep_corrected_combined <- left_join(lipidomics_samples_sep_corrected, lipidomics_samples_sep_corrected_with_enrichment_data) %>% left_join(., lipidomics_samples_sep_corrected_labeled)
+
+#saveRDS(lipidomics_samples_sep_corrected_combined, "lipidomics_samples_sep_corrected_combined.rds")
+```
+
+
+# Add metdata
+```{r}
+#read in irMS data
+Folch_frac <-read.csv("output/EC_combinedtimepointBudget_Folch_statready.csv")
+#pivot necessary lipid columns
+lipids <- Folch_frac %>% select(c(Catalog.Number, Fraction, mg.pool.per.g.dry.soil, Pool_Pct_ug_13Cexcess_g_soil)) %>% filter(Fraction == "Lipid") %>% group_by(Catalog.Number) %>% pivot_wider(names_from = Fraction, values_from =c(mg.pool.per.g.dry.soil, Pool_Pct_ug_13Cexcess_g_soil))
+ #pivot necessary WS columns 
+total_soil <- Folch_frac %>% select(c(Catalog.Number, Fraction, mg.Total.C.per.g.dry.soil,  atom_pct.13C)) %>% filter(Fraction == "WS") %>% group_by(Catalog.Number) %>% pivot_wider(names_from = Fraction, values_from =c(mg.Total.C.per.g.dry.soil,  atom_pct.13C))
+#combine and rename
+Folch <- left_join(lipids, total_soil) %>% dplyr::rename("catalog_number" = "Catalog.Number", "mg_lipid_g_soil" = "mg.pool.per.g.dry.soil_Lipid", "ug_13C_excess_lipids_g_soil" = "Pool_Pct_ug_13Cexcess_g_soil_Lipid", "mg_C_g_soil" = "mg.Total.C.per.g.dry.soil_WS", "atm_perc_13C_soil" = "atom_pct.13C_WS")
+#join with meta
+meta <- left_join(meta, Folch) 
+```
+
+
+# Prep data for PhyloSeq
+```{r}
+#sample dataframe
+samples_df <- meta %>% filter(!is.na(site)) %>% filter(polarity == "positive") %>% filter(crop == "Switchgrass") %>% filter(amendment == "13C_Gluc") %>% select(catalog_number, site, crop, block, timepoint, group, amendment, mg_lipid_g_soil, ug_13C_excess_lipids_g_soil, mg_C_g_soil, atm_perc_13C_soil) %>% mutate(
+  timepoint_abbr = ifelse(timepoint == "2Month", "2m", "1y"),
+  sample = catalog_number,
+  site_crop = paste0(site, "_", crop),
+  Label = paste0(crop, "_", block, " ", timepoint_abbr),
+  Sample = paste0(crop, "_", block, " ", timepoint_abbr)) %>% arrange(sample) 
+
+samples_df <- rbind(samples_df %>% mutate(type = "Identified lipids", sample = paste0(sample, "_identified")), samples_df %>% mutate(type = "Confidently enriched lipids", sample = paste0(sample, "_labeled")), samples_df %>% mutate(type = "Enrichment-quantified lipids", sample = paste0(sample, "_with_enrichment_data"))) %>% mutate(type = factor(type, levels = c("Identified lipids", "Enrichment-quantified lipids", "Confidently enriched lipids"))) %>%  tibble::column_to_rownames("sample") 
+
+#create vector to select only samples of interest
+samples <- rownames(samples_df)
+
+#create otu table (PLFAs)
+#otu_table_lipids <- lipid_e %>% dplyr::rename("otu" = "Compound")
+#row.names(otu_table_lipids) <- NULL
+#create otu table (intact lipids)
+otu_table_lipids <- lipidomics_samples_sep_corrected_combined %>% select(-Compound) %>% dplyr::rename("otu" = "Lipid_sep") %>% distinct()
+row.names(otu_table_lipids) <- NULL
+
+#create taxonomy table (PLFAs)
+#taxonomy_lipids <- lipid_meta %>% select(c(Compound, Marker)) %>% mutate(PLFA = Compound) %>% dplyr::rename("otu" = "Compound")
+#row.names(taxonomy_lipids) <- NULL
+#create taxonomy table (intact lipids)
+taxonomy_lipids <- meta_rodin_taxonomy %>% mutate(`Lipid Headgroup` = Lipid_subclass) %>% select(c(Lipid_sep, Category.x, `Lipid Headgroup`, avg_chain_C, avg_chain_DBE)) %>% mutate(Compound = Lipid_sep) %>%
+dplyr::rename("otu" = "Lipid_sep", "Lipid_class" = "Category.x")
+row.names(taxonomy_lipids) <- NULL
+
+#convert otu table and taxonomy table to matrices
+otu_mat_lipids <- otu_table_lipids %>% tibble::column_to_rownames("otu") %>% select(sort(names(.))) %>% replace(is.na(.), 0) %>% as.matrix()
+tax_mat_lipids <- taxonomy_lipids %>%  tibble::column_to_rownames("otu") %>% as.matrix() 
+```
+
+```{r}
+lipidomics_samples_sep_corrected_with_enrichment_data_long <- lipidomics_samples_sep_corrected_with_enrichment_data %>% pivot_longer(cols = starts_with("EC"), names_to = "catalog", values_to = "log2intensity")
+
+intensity_meta <- left_join(lipidomics_samples_sep_corrected_with_enrichment_data_long, samples_df %>% rownames_to_column("catalog")) %>% na.omit() %>% distinct() %>% mutate(id = paste0(Compound, "__", Lipid_sep, "_", block)) %>% ungroup()
+
+anova <- intensity_meta %>% anova_test(log2intensity ~ timepoint*site + Error(id/(timepoint*site)))
+```
+
+
+## Read data into PhyloSeq
+```{r}
+ OTU = otu_table(otu_mat_lipids, taxa_are_rows = TRUE)
+ TAX = tax_table(tax_mat_lipids)
+ samples = sample_data(samples_df)
+  
+ ps_lipids <- phyloseq(OTU, TAX, samples)
+ ps_lipids
+```
+
+## Top 13 barplot, merged all vs labeled 
+```{r}
+#top 13
+ps_lipids %>% 
+  phyloseq::merge_samples(group = "type") %>%
+  comp_barplot(
+    tax_level = "Lipid Headgroup",
+    tax_order = c("PC", "PE", "PG", "PI", "Cer", "DGTSA", "DG", "TG", "FA", "HA", "Other"),
+    sample_order = c("Confidently enriched lipids", "Enrichment-quantified lipids", "Identified lipids"),
+    #facet_by = "site",
+    #label = "Label", # name an alternative variable to label axis
+    n_taxa = 13, # give more taxa unique colours
+    #taxon_renamer = function(x) stringr::str_replace_all(x, "_", " "), # remove underscores
+    other_name = "Other", # set custom name for the "other" category
+    #merge_other = FALSE, # split the "Other" category to display alpha diversity
+    bar_width = 0.9, # reduce the bar width to 70% of one row
+    #bar_outline_colour = "grey5" # is the default (use NA to remove outlines)
+    #order_with_all_taxa = TRUE
+  ) +
+  coord_flip()
+```
+
+### not merged
+```{r}
+#top 13
+bp <- ps_lipids %>% 
+  comp_barplot(
+    tax_level = "Lipid Headgroup",
+    tax_order = c("PC", "PE", "PG", "PI", "Cer", "DGTSA", "DG", "TG", "FA", "HA", "Other"),
+    #sample_order = "identity",
+    #facet_by = "site",
+    #label = NULL, # name an alternative variable to label axis
+    n_taxa = 13, # give more taxa unique colours
+    #taxon_renamer = function(x) stringr::str_replace_all(x, "_", " "), # remove underscores
+    other_name = "Other", # set custom name for the "other" category
+    merge_other = FALSE, # split the "Other" category to display alpha diversity
+    #bar_width = 0.9, # reduce the bar width to 70% of one row
+    bar_outline_colour = NA # is the default (use NA to remove outlines)
+    #order_with_all_taxa = TRUE
+  ) +
+  facet_wrap("type", nrow = 3, scales = "free") +
+  labs(y = "Proportion of lipidome", x = NULL) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), strip.background = element_blank()) +
+  coord_flip()
+
+bp
+
+#saveRDS(bp, "output/bp.rds")
+```
+
+```{r}
+ps_lipids %>% 
+  comp_barplot(
+  tax_level = "Lipid Headgroup", n_taxa = 13, group_by = "type",
+ bar_outline_colour = NA, tax_order = c("PC", "PE", "PG", "PI", "Cer", "DGTSA", "DG", "TG", "FA", "HA", "Other"),
+) %>%
+  patchwork::wrap_plots(nrow = 3, guides = "collect") &
+  coord_flip() & labs(x = NULL, y = NULL) &
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+```
+
+# Differential abundance analysis
+Simple linear regression using log2-transformed relative abundances (as the dependent variable); test for differences in the average relative abundance of each lipid between labeled and unlabeled samples
+```{r}
+#Difference between Lipids with labeling data and labeled lipids...need to filter first 
+# First transform
+headgroupStats <- ps_lipids %>% ps_filter(type != "All identified lipids") %>%
+  tax_transform(trans = "compositional", rank = "Lipid Headgroup") %>%
+  # run all the statistical models
+  taxatree_models(
+    ranks = c("Lipid Headgroup"),
+    trans = "identity",
+    variables = "type", type = lm # modelling function
+  ) %>%
+  # extract stats from the models
+  taxatree_models2stats(.keep_models = TRUE) %>%
+  # adjust the p values for multiple testing, within each rank
+  taxatree_stats_p_adjust(method = "fdr", grouping = "rank")
+
+ hg_stats_table <- taxatree_stats_get(headgroupStats) %>% mutate(is.sig = ifelse(p.adj.fdr.rank < 0.01, "sig", NA))
+ 
+hg_stats_table
+
+
+headgroupStats2 <- ps_lipids %>% ps_filter(type != "Labeled lipids") %>%
+  tax_transform(trans = "compositional", rank = "Lipid Headgroup") %>%
+  # run all the statistical models
+  taxatree_models(
+    ranks = c("Lipid Headgroup"),
+    trans = "identity", 
+    variables = "type", type = lm # modelling function
+  ) %>%
+  # extract stats from the models
+  taxatree_models2stats(.keep_models = TRUE) %>%
+  # adjust the p values for multiple testing, within each rank
+  taxatree_stats_p_adjust(method = "fdr", grouping = "rank")
+
+ hg_stats_table2 <- taxatree_stats_get(headgroupStats2) %>% mutate(is.sig = ifelse(p.adj.fdr.rank < 0.01, "sig", NA))
+ 
+hg_stats_table2
+```
+
+

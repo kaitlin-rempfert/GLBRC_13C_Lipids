@@ -1,0 +1,349 @@
+---
+title: "Lipidomics Normalization with pmartR"
+author: "Kaitlin Rempfert"
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+output:
+  html_document: 
+    df_print: paged 
+    number_sections: yes 
+    css: stylesheet.css 
+    toc: yes 
+    toc_float: true 
+    toc_depth: 3 
+    code_folding: show 
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo = FALSE, message=FALSE, warning=FALSE}
+# load required packages
+library(tidyverse)
+library(ggplot2)
+library(pmartR)
+library(pander)
+library(emmeans)
+library(openxlsx)
+```
+
+
+# Positive Mode
+
+## Read in lipidomic data object in pmartR
+
+```{r}
+mylipidData_pos <- readRDS("output/pmartR/mylipidData_pos_batch3.rds")
+```
+
+Need to go back and reprocess raw data without corn samples, but for now just filter out 
+```{r}
+#vector of corn samples
+corn <- mylipidData_pos$f_data %>% filter(crop == "Corn")
+Corn <- corn$sample_name
+
+myfilt <- custom_filter(mylipidData_pos, f_data_remove = Corn)
+mylipidData_pos <- applyFilt(myfilt, mylipidData_pos)
+```
+
+Missing values (or 0's) are represented by NA, and data were log2 transformed.
+```{r}
+#replace 0's with NAs -- this is now done automatically when the data object is created via as.lipidData 
+mylipidData_pos <- edata_replace(mylipidData_pos, x = 0, y = NA)
+
+#log transform the data
+mylipidData_pos <- edata_transform(mylipidData_pos, data_scale = "log2")
+attributes(mylipidData_pos)$data_info$data_scale
+
+# shorten sample names for plotting purposes
+mylipidData_pos <- custom_sampnames(mylipidData_pos, delim = "_", components = c(1:4))
+
+# define groups based on the "group" variable
+mylipidData_pos <- group_designation(mylipidData_pos, main_effects = "group", batch_id = "batch")
+
+plot(mylipidData_pos, use_VizSampNames = TRUE, color_by = "group", order_by = "group")
+```
+
+
+Quality control (QC) samples were run throughout the batches of this study, however, given previous unsuccessful attempts at batch effect correction, only the data from the more recent batch is being used. Therefore, we have no need of the QC samples going forward and we remove them from the dataset now. 
+
+```{r}
+#vector of QC samples
+qc <- mylipidData_pos$f_data %>% filter(group == "qc")
+QC <- qc$sample_name
+
+myfilt <- custom_filter(mylipidData_pos, f_data_remove = QC)
+mylipidData_pos <- applyFilt(myfilt, mylipidData_pos)
+```
+
+
+
+
+Below, we look at the number of samples in each site-by-timepoint combination by batch. We are restricting the data to a single batch, numbered "3".
+
+**Table: Group by Batch**
+```{r}
+pander(table(mylipidData_pos$f_data$group, mylipidData_pos$f_data$batch, useNA = "ifany"))
+```
+
+
+
+
+## Quality Control
+
+All lipids were present in at least 2 samples within each batch.
+
+```{r}
+myfilter <- molecule_filter(mylipidData_pos)
+summary(myfilter, min_num = 2)
+# filter not applied because it doesn't remove any lipids
+```
+
+
+```{r}
+# look for potential sample outliers
+myfilter <- rmd_filter(mylipidData_pos, metrics = c("MAD", "Skewness", "Correlation"))
+temp <- summary(myfilter, pvalue_threshold = 0.0001)
+potential_outliers <- temp$filtered_samples
+```
+
+RMD-PAV is used to identify potential outliers, of which `r length(potential_outliers)` are identified: 
+
+`r print(potential_outliers)`
+
+```{r}
+plot(myfilter, pvalue_threshold = 0.0001, use_VizSampNames = TRUE)
+
+if(length(potential_outliers) > 0){
+  for(i in 1:length(potential_outliers)){
+    print(plot(myfilter, sampleID = potential_outliers[i], use_VizSampNames = TRUE))
+  }
+}
+
+mylipidData_pos$f_data[which(mylipidData_pos$f_data$sample_name %in% potential_outliers), ]
+```
+
+
+```{r}
+mycor <- cor_result(mylipidData_pos)
+plot(mycor, interactive = TRUE)
+
+# nothing looks terribly egregious here
+```
+
+
+```{r}
+mydimres <- dim_reduction(mylipidData_pos)
+plot(mydimres, interactive = TRUE)
+
+mypca <- data.frame(SampleID = mydimres$SampleID, PC1 = mydimres$PC1, PC2 = mydimres$PC2)
+
+```
+
+
+We remove 1 sample as an outlier: EC5063_L2_Pos_25Jan20.
+
+```{r}
+myfilt <- custom_filter(mylipidData_pos, f_data_remove = c("EC5063_L2_Pos_25Jan20_Brandi_WCSH115319.mzXML"))
+mylipidData_pos <- applyFilt(myfilt, mylipidData_pos)
+```
+
+
+## Normalization
+
+
+```{r}
+# median center the data
+mylipidData_pos <- normalize_global(mylipidData_pos, subset_fn = "all", norm_fn = "median", backtransform = TRUE, apply_norm = TRUE)
+
+plot(mylipidData_pos, use_VizSampNames = TRUE, color_by = "group", order_by = "group")
+
+saveRDS(mylipidData_pos, "output/lipid_pos_median.RDS")
+```
+
+
+Look at PCA plot after normalization:
+
+```{r}
+mydimres <- dim_reduction(mylipidData_pos)
+plot(mydimres, interactive = TRUE)
+
+mypca <- data.frame(SampleID = mydimres$SampleID, PC1 = mydimres$PC1, PC2 = mydimres$PC2)
+```
+
+
+
+# Negative Mode
+
+## Read in lipidomic data object in pmartR
+```{r}
+mylipidData_neg <- readRDS("output/pmartR/mylipidData_neg_batch4.rds")
+```
+
+Need to go back and reprocess raw data without corn samples, but for now just filter out 
+```{r}
+#vector of corn samples
+corn <- mylipidData_neg$f_data %>% filter(crop == "Corn")
+Corn <- corn$sample_name
+
+myfilt <- custom_filter(mylipidData_neg, f_data_remove = Corn)
+mylipidData_neg <- applyFilt(myfilt, mylipidData_neg)
+```
+
+Missing values (or 0's) are represented by NA, and data were log2 transformed.
+```{r}
+#replace 0's with NAs
+mylipidData_neg <- edata_replace(mylipidData_neg, x = 0, y = NA)
+
+#log transform the data
+mylipidData_neg <- edata_transform(mylipidData_neg, data_scale = "log2")
+# attributes(mylipidData_neg)$data_info$data_scale
+
+# shorten sample names for plotting purposes
+mylipidData_neg <- custom_sampnames(mylipidData_neg, delim = "_", components = c(1:4))
+
+# define groups babsed on the "group" variable
+mylipidData_neg <- group_designation(mylipidData_neg, main_effects = "group", batch_id = "batch")
+
+plot(mylipidData_neg, use_VizSampNames = TRUE, color_by = "group", order_by = "group")
+```
+
+
+Quality control (QC) samples were run throughout the batches of this study, however, given previous unsuccessful attempts at batch effect correction, only the data from the more recent batch is being used. Therefore, we have no need of the QC samples going forward and we remove them from the dataset now. 
+
+```{r}
+#vector of QC samples
+qc <- mylipidData_neg$f_data %>% filter(group == "qc")
+QC <- qc$sample_name
+
+myfilt <- custom_filter(mylipidData_neg, f_data_remove = QC)
+mylipidData_neg <- applyFilt(myfilt, mylipidData_neg)
+```
+
+Below, we look at the number of samples in each site-by-timepoint combination by batch. We are restricting the data to a single batch, numbered "3".
+
+**Table: Group by Batch**
+
+```{r}
+pander(table(mylipidData_neg$f_data$group, mylipidData_neg$f_data$batch, useNA = "ifany"))
+```
+
+
+## Quality Control
+
+All lipids were present in at least 2 samples within each batch.
+
+```{r}
+myfilter <- molecule_filter(mylipidData_neg)
+summary(myfilter, min_num = 2)
+# filter not applied because it doesn't remove any lipids
+```
+
+```{r}
+# look for potential sample outliers
+myfilter <- rmd_filter(mylipidData_neg, metrics = c("MAD", "Skewness", "Correlation"))
+temp <- summary(myfilter, pvalue_threshold = 0.0001)
+potential_outliers <- temp$filtered_samples
+```
+
+RMD-PAV is used to identify potential outliers, of which `r length(potential_outliers)` is/are identified: 
+
+`r print(potential_outliers)`
+
+```{r}
+plot(myfilter, pvalue_threshold = 0.0001, use_VizSampNames = TRUE)#, order_by = "group")
+
+if(length(potential_outliers) > 0){
+  for(i in 1:length(potential_outliers)){
+    print(plot(myfilter, sampleID = potential_outliers[i], use_VizSampNames = TRUE))
+  }
+}
+
+mylipidData_neg$f_data[which(mylipidData_neg$f_data$sample_name %in% potential_outliers), ]
+
+# 32  EC5063_L2_Neg_02Feb21_Brandi_WCSH115319.mzXML WS_2m 4 249 Wisconsin Switchgrass 2Month
+# 32 EC5063 --> was also outlier in positive mode
+```
+
+```{r}
+mycor <- cor_result(mylipidData_neg)
+plot(mycor, interactive = TRUE)
+```
+
+```{r}
+mydimres <- dim_reduction(mylipidData_neg)
+plot(mydimres, interactive = TRUE)
+
+mypca <- data.frame(SampleID = mydimres$SampleID, PC1 = mydimres$PC1, PC2 = mydimres$PC2)
+```
+
+We remove 1 sample as an outlier: EC5063_L2_Neg_02Feb21. This is the same sample that was removed from the Positive Mode data.
+
+```{r}
+myfilt <- custom_filter(mylipidData_neg, f_data_remove = c("EC5063_L2_Neg_02Feb21_Brandi_WCSH115319.mzXML"))
+mylipidData_neg <- applyFilt(myfilt, mylipidData_neg)
+```
+
+
+## Normalization
+
+```{r}
+# median center the data
+mylipidData_neg <- normalize_global(mylipidData_neg, subset_fn = "all", norm_fn = "median", backtransform = TRUE, apply_norm = TRUE)
+
+plot(mylipidData_neg, use_VizSampNames = TRUE, color_by = "group", order_by = "group")
+
+saveRDS(mylipidData_neg,"output/lipid_neg_median.RDS")
+```
+
+Look at PCA plot after normalization:
+
+```{r}
+mydimres <- dim_reduction(mylipidData_neg)
+plot(mydimres, interactive = TRUE)
+
+mypca <- data.frame(SampleID = mydimres$SampleID, PC1 = mydimres$PC1, PC2 = mydimres$PC2)
+```
+
+
+
+# Combine Positive and Negative mode data
+
+Now that data have been normalized, we combine the negative and positive ionization mode into a single dataset. Sample names have been truncated so that they are identical between the negative and posisive ionization modes.
+
+```{r}
+# make the sample names the same between the two ionization modes
+
+# create the new names
+new_neg_names <- unlist(lapply(str_split(mylipidData_neg$f_data$sample_name, "_"), function(x) paste(x[1], x[2], sep = "_")))
+new_pos_names <- unlist(lapply(str_split(mylipidData_pos$f_data$sample_name, "_"), function(x) paste(x[1], x[2], sep = "_")))
+
+# check some stuff
+all(new_neg_names == new_pos_names) # new names for neg and pos all match
+all(mylipidData_neg$f_data$sample_name == names(mylipidData_neg$e_data)[-1]) # order of samples in e_data and f_data is the same within neg mode
+all(mylipidData_pos$f_data$sample_name == names(mylipidData_pos$e_data)[-1]) # order of samples in e_data and f_data is the same within pos mode
+
+# set the new names
+mylipidData_neg$f_data$sample_name <- new_neg_names
+names(mylipidData_neg$e_data)[-1] <- new_neg_names
+mylipidData_pos$f_data$sample_name <- new_pos_names
+names(mylipidData_pos$e_data)[-1] <- new_pos_names
+```
+
+Lipid identifiers have been augmented to include the mode in which it was identified.
+```{r}
+# de-dupe any duplicate edata identifiers
+mylipidData_neg$e_data[,get_edata_cname(mylipidData_neg)] <- paste0("mylipidData_neg_", mylipidData_neg$e_data[,get_edata_cname(mylipidData_neg)])
+# de-dupe any duplicate emeta identifiers
+mylipidData_neg$e_meta[,get_edata_cname(mylipidData_neg)] <- paste0("mylipidData_neg_", mylipidData_neg$e_meta[,get_edata_cname(mylipidData_neg)])
+
+# combine them
+mylipidData <- combine_lipidData(mylipidData_pos, mylipidData_neg, retain_groups = T, retain_filters = T)
+plot(mylipidData, order_by = "group", color_by = "group")
+
+# make Crop and Site into factors so I can control the order in the models below
+mylipidData$f_data$crop <- factor(mylipidData$f_data$crop, levels = c("Switchgrass", "Corn"))
+mylipidData$f_data$site <- factor(mylipidData$f_data$site, levels = c("Michigan", "Wisconsin"))
+
+saveRDS(mylipidData, "output/pmartR/mylipidData.RDS")
+```
+
+ 

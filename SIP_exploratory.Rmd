@@ -1,0 +1,75 @@
+
+---
+title: "13C Glucose Soil Incubation SIP-Lipidomics Data Exploration"
+author: "Kaitlin Rempfert"
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+output:
+  html_document: 
+    df_print: paged 
+    number_sections: yes 
+    css: stylesheet.css 
+    toc: yes 
+    toc_float: true 
+    toc_depth: 3 
+    code_folding: show 
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, echo = FALSE, message=FALSE, warning=FALSE}
+# load required packages
+library(tidyverse)
+library(ggplot2)
+library(stringi)
+library(xcms)
+library(IsoCorrectoR)
+library(rstatix)
+library(ggpubr)
+```
+
+
+```{r}
+combined_rel_enrich  <- readRDS("output/combined_rel_enrich_4_23.rds")
+combined_SIP <- readRDS("output/combined_SIP_4_23.rds")
+
+sig <- combined_SIP %>% select(Compound, group, p) %>% distinct()
+
+all <- left_join(combined_rel_enrich, sig)
+
+all_meta <- all %>% mutate(
+  timepoint = ifelse(grepl("2m", group), "2month", "1year"), 
+  timepoint = factor(timepoint, levels = c("2month", "1year")),
+  site = ifelse(grepl("W", group), "Wisconsin", "Michigan"),
+  site = as.factor(site),
+  crop = ifelse(grepl("C", group), "Corn", "Switchgrass"),
+  crop = as.factor(crop),
+  site_crop = paste0(site," ", crop),
+  site_crop = as.factor(site_crop),
+  sig = ifelse(p < 0.05, "significant", "not significant"), 
+  sig = as.factor(sig),
+  lipid_class = case_when(
+    grepl("PE", Compound) ~ "PE", 
+    grepl("PI", Compound) ~ "PI", 
+    grepl("Cer", Compound) ~ "Cer",
+    grepl("FA", Compound) ~ "FA",
+    grepl("Hydroxy", Compound) ~ "HA",
+    grepl("PG", Compound) ~ "PG",
+    grepl("PC", Compound) ~ "PC",
+    grepl("TG", Compound) ~ "TG",
+    grepl("DGTSA", Compound) ~ "DGTSA",
+    grepl("DG(", Compound, fixed = TRUE) ~ "DG",
+    TRUE ~ "other"
+  ),
+  lipid_class = factor(lipid_class, levels = c("PC", "PE", "PG", "PI", "Cer", "DGTSA", "DG", "TG", "FA", "HA", "other"))
+) %>% filter(lipid_class != "other") %>% filter(crop != "Corn") %>% ungroup() %>% select(-Rep) %>% distinct() %>% select(-c(group, crop, site_crop))
+```
+
+```{r}
+p <- all_meta %>% filter(timepoint == "2month") %>% filter(sig == "significant") %>% ggboxplot(x = "lipid_class", y = "mean_rel_enrichment",
+      color = "lipid_class", palette = "Paired") + rremove("legend") + labs(x = "Lipid Class", y = expression("Excess Atom Fraction "*{}^13*"C"))
+p
+
+bp <- readRDS("output/bp.rds")
+
+plot_grid(bp, p, labels = c("A", "B"), ncol = 1)
+```

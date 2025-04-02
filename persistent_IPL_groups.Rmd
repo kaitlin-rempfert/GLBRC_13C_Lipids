@@ -1,0 +1,536 @@
+---
+title: "Persistent Lipids"
+author: "Kaitlin Rempfert"
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+output:
+  html_document: 
+    df_print: paged 
+    number_sections: yes 
+    css: stylesheet.css 
+    toc: yes 
+    toc_float: true 
+    toc_depth: 3 
+    code_folding: show 
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo = FALSE, message=FALSE, warning=FALSE}
+# load required packages
+library(tidyverse)
+library(ggplot2)
+library(pmartR)
+library(pander)
+library(emmeans)
+library(openxlsx)
+library(ggpubr)
+library(rstatix)
+library(Rodin)
+library(ComplexHeatmap)
+library(CHNOSZ)
+```
+
+# Enrichment Data
+## Import enrichment data and lipid metadata
+```{r}
+e_data_enrich_long <- readRDS("output/e_data_enrich_long_meta.RDS")
+lipidomics_Rodin_meta <- readRDS("output/lipidomics_Rodin_meta.Rds")
+```
+
+
+## Group IPLs by Rodin metaadata
+```{r}
+#add additional grouping variables
+lipidomics_Rodin_meta <- lipidomics_Rodin_meta %>% mutate(
+  `Sub class` = case_when(
+   `Sub class` != "" ~ `Sub class`,
+   `Double Bonds` == 0 ~ "saturated",
+   `Double Bonds` == 1 ~ "monounsaturated",
+   `Double Bonds` > 1 ~ "polyunsaturated"
+  ),
+  subclass = paste0(`Sub class`, " ", `Main class`)
+)
+
+#merge with metadata
+e_data_enrich_long_Rodin <- left_join(e_data_enrich_long, lipidomics_Rodin_meta) %>% na.omit()
+
+#calculate mean atom% of lipid groups
+e_data_enrich_long_Rodin_g <- e_data_enrich_long_Rodin %>% group_by(subclass, id, TimePoint) %>% 
+  filter(`Main class` != "CoQ") %>% mutate(
+  atomperc_subclass = mean(atomperc, na.rm = TRUE)
+) %>% ungroup() %>%
+  group_by(`Sub class`, id, TimePoint) %>%
+  mutate(atomperc_sub_class= mean(atomperc, na.rm = TRUE)) %>%
+  ungroup() %>% 
+  group_by(`Main class`, id, TimePoint) %>% 
+  mutate(atomperc_headgroup = mean(atomperc, na.rm = TRUE)) %>% 
+  ungroup() %>%
+  group_by(Category, id, TimePoint) %>% 
+  mutate(atomperc_category = mean(atomperc, na.rm = TRUE)) %>%
+  ungroup() 
+
+#reformat to long df for t-tests
+e_data_enrich_longer_Rodin_g <- e_data_enrich_long_Rodin_g %>% 
+  pivot_longer(cols = c(contains("atomperc_")), names_to = "group", names_prefix = "atomperc_", values_to = "atomperc_group") %>% 
+  #add "Lipid Group" column to print the group name for group atomperc values
+  mutate(
+    `Lipid Group` = case_when(
+      group == "subclass" ~ subclass, 
+      group == "sub_class" ~ `Sub class`,
+      group == "headgroup" ~ `Main class`,
+      group == "category" ~ Category
+    )
+  )
+
+e_data_enrich_long_meta <- e_data_enrich_longer_Rodin_g %>% select(c(`Lipid Group`, Site, TimePoint, id, group, atomperc_group)) %>% dplyr::rename("Compound" = "Lipid Group", "atomperc" = "atomperc_group")
+```
+
+
+```{r}
+#perform t-test (keep sites separate in case a lipid is persistent in one site and not another)
+compound_enrichment_ttest_sep <- e_data_enrich_long_meta  %>%
+  select(c(Compound, Site, TimePoint, id, atomperc)) %>%
+  arrange(Compound, Site, TimePoint, id) %>%
+  group_by(Compound, Site) %>%
+  t_test(atomperc ~ TimePoint, paired = TRUE) %>%
+  add_significance(cutpoints = c(0, 1e-04, 0.001, 0.01, 0.1, 1),
+  symbols = c("****", "***", "**", "*", "ns"))
+#perform t-test again without separating sites
+compound_enrichment_ttest <- e_data_enrich_long_meta  %>%
+  select(c(Compound, Site, TimePoint, id, atomperc)) %>%
+  arrange(Compound, Site, TimePoint, id) %>%
+  group_by(Compound) %>%
+  t_test(atomperc ~ TimePoint, paired = TRUE) %>%
+  add_significance(cutpoints = c(0, 1e-04, 0.001, 0.01, 0.1, 1),
+  symbols = c("****", "***", "**", "*", "ns"))
+    
+#calculate Cohen's d (keep sites separate in case a lipid is persistent in one site and not another)
+compound_enrichment_cohens_sep <- e_data_enrich_long_meta %>% 
+  select(c(Compound, Site, TimePoint, id, atomperc)) %>%
+  arrange(Compound, Site, TimePoint, id) %>%
+  group_by(Compound, Site) %>%
+  cohens_d(atomperc ~ TimePoint, paired = TRUE)  
+#perform Cohen's d without separating sites 
+compound_enrichment_cohens <- e_data_enrich_long_meta %>% 
+  select(c(Compound, Site, TimePoint, id, atomperc)) %>%
+  arrange(Compound, Site, TimePoint, id) %>%
+  group_by(Compound) %>%
+  cohens_d(atomperc ~ TimePoint, paired = TRUE)  
+
+#combine t-test and cohen's d outputs
+compound_enrichment_stats_sep <- left_join(compound_enrichment_ttest_sep, compound_enrichment_cohens_sep)
+compound_enrichment_stats <- left_join(compound_enrichment_ttest, compound_enrichment_cohens)
+
+#reformat output for joining for intensity data 
+compound_enrichment_stats_rf_sep <- left_join(e_data_enrich_long_meta, compound_enrichment_stats_sep %>% select(c(Compound, Site, group1, group2, p, effsize)) %>% dplyr::rename("p_enrich" = "p") %>% dplyr::rename("effsize_enrich" = "effsize"))
+compound_enrichment_stats_rf <- left_join(e_data_enrich_long_meta, compound_enrichment_stats %>% select(c(Compound, group1, group2, p, effsize)) %>% dplyr::rename("p_enrich" = "p") %>% dplyr::rename("effsize_enrich" = "effsize"))
+```
+
+# Intensity Data
+## Import Intensity Data
+```{r}
+#read in abundance data 
+e_data_long_intensity <- readRDS("output/e_data_long_meta_filt.RDS") %>% select(-group)
+```
+
+
+```{r}
+#merge with metadata
+e_data_long_Rodin <- left_join(e_data_long_intensity, lipidomics_Rodin_meta) %>% na.omit()
+
+#calculate mean log2 intensity  of lipid groups
+e_data_long_Rodin_g <- e_data_long_Rodin %>% group_by(subclass, id, TimePoint) %>%
+  filter(`Main class` != "CoQ") %>% mutate(
+  log2_intensity_subclass = mean(log2_intensity, na.rm = TRUE)
+) %>% ungroup() %>%
+  group_by(`Sub class`, id, TimePoint) %>%
+  mutate(log2_intensity_sub_class= mean(log2_intensity, na.rm = TRUE)) %>%
+  ungroup() %>% 
+  group_by(`Main class`, id, TimePoint) %>% 
+  mutate(log2_intensity_headgroup = mean(log2_intensity, na.rm = TRUE)) %>% 
+  ungroup() %>%
+  group_by(Category, id, TimePoint) %>% 
+  mutate(log2_intensity_category = mean(log2_intensity, na.rm = TRUE)) %>%
+  ungroup() 
+
+#reformat to long df for t-tests
+e_data_longer_Rodin_g <- e_data_long_Rodin_g %>% 
+  pivot_longer(cols = c(contains("log2_intensity_")), names_to = "group", names_prefix = "log2_intensity_", values_to = "log2_intensity_group") %>% 
+  #add "Lipid Group" column to print the group name for group log2_intensity values
+  mutate(
+    `Lipid Group` = case_when(
+      group == "subclass" ~ subclass, 
+      group == "sub_class" ~ `Sub class`,
+      group == "headgroup" ~ `Main class`,
+      group == "category" ~ Category
+    )
+  )
+
+e_data_long_meta <- e_data_longer_Rodin_g %>% select(c(`Lipid Group`, Site, TimePoint, id, group, log2_intensity_group)) %>% dplyr::rename("Compound" = "Lipid Group", "log2_intensity" = "log2_intensity_group") %>% distinct()
+```
+
+
+```{r}
+#perform t-test (keep sites separate in case a lipid is persistent in one site and not another)
+compound_intensity_ttest_sep <- e_data_long_meta  %>%
+  select(c(Compound, Site, TimePoint, id, log2_intensity)) %>%
+  arrange(Compound, Site, TimePoint, id) %>%
+  group_by(Compound, Site) %>%
+  t_test(log2_intensity ~ TimePoint, paired = TRUE, var.equal = FALSE) %>%
+  add_significance(cutpoints = c(0, 1e-04, 0.001, 0.01, 0.1, 1),
+  symbols = c("****", "***", "**", "*", "ns"))
+#perform t-test again without separating sites 
+compound_intensity_ttest <- e_data_long_meta  %>%
+  select(c(Compound, Site, TimePoint, id, log2_intensity)) %>%
+  arrange(Compound, Site, TimePoint, id) %>%
+  group_by(Compound) %>%
+  t_test(log2_intensity ~ TimePoint, paired = TRUE, var.equal = FALSE) %>%
+  add_significance(cutpoints = c(0, 1e-04, 0.001, 0.01, 0.1, 1),
+  symbols = c("****", "***", "**", "*", "ns"))
+    
+#calculate Cohen's d (keep sites separate in case a lipid is persistent in one site and not another)
+compound_intensity_cohens_sep <-e_data_long_meta %>% 
+  select(c(Compound, Site, TimePoint, id, log2_intensity)) %>%
+  arrange(Compound, Site, TimePoint, id) %>%
+  group_by(Compound, Site) %>%
+ cohens_d(log2_intensity ~ TimePoint, paired = TRUE) %>%
+  add_significance(cutpoints = c(0, 1e-04, 0.001, 0.01, 0.1, 1),
+  symbols = c("****", "***", "**", "*", "ns"))
+#recalculate without separating sites
+compound_intensity_cohens <-e_data_long_meta %>% 
+  select(c(Compound, Site, TimePoint, id, log2_intensity)) %>%
+  arrange(Compound, Site, TimePoint, id) %>%
+  group_by(Compound) %>%
+ cohens_d(log2_intensity ~ TimePoint, paired = TRUE) %>%
+  add_significance(cutpoints = c(0, 1e-04, 0.001, 0.01, 0.1, 1),
+  symbols = c("****", "***", "**", "*", "ns"))
+
+#combine t-test and cohen's d outputs
+compound_intensity_stats_sep <- left_join(compound_intensity_ttest_sep, compound_intensity_cohens_sep)
+compound_intensity_stats <- left_join(compound_intensity_ttest, compound_intensity_cohens)
+
+#reformat output for joining for intensity data 
+compound_intensity_stats_rf_sep <- left_join(e_data_long_meta, compound_intensity_stats_sep %>% select(c(Compound, Site, group1, group2, p, effsize)) %>% dplyr::rename("p_intensity" = "p") %>% dplyr::rename("effsize_intensity" = "effsize"))
+compound_intensity_stats_rf <- left_join(e_data_long_meta, compound_intensity_stats %>% select(c(Compound, group1, group2, p, effsize)) %>% dplyr::rename("p_intensity" = "p") %>% dplyr::rename("effsize_intensity" = "effsize"))
+```
+
+Quantification of the effect size magnitude is performed using the thresholds defined in Cohen (1992). The magnitude is assessed using the thresholds provided in (Cohen 1992), i.e. |d| < 0.2 "negligible", |d| < 0.5 "small", |d| < 0.8 "medium", otherwise "large".
+
+## Combine 
+```{r}
+compound_stats_combined_sep <- left_join(compound_enrichment_stats_rf_sep, compound_intensity_stats_rf_sep) %>% distinct()
+compound_stats_combined <- left_join(compound_enrichment_stats_rf, compound_intensity_stats_rf) %>% distinct()
+
+#add categorical groupings 
+compounds_classified <- compound_stats_combined %>% mutate(
+  classification = case_when(
+    #persistent: p_enrich > 0.05, abs(effsize_enrich) < 0.2, p_intensity > 0.05, abs(effsize_intensity) < 0.2
+    p_enrich > 0.01 & abs(effsize_enrich) < 0.2 & p_intensity > 0.01 & abs(effsize_intensity) < 0.2 ~ "persistent",
+    #continued production (labeled): p_intensity < 0.05, effsize_intensity > 0.5, p_enrich < 0.05, effsize_enrich > 0.5; effsize_intensity > 0.5, p_enrich < 0.05, effsize_enrich < -0.5 (unlabeled)
+    p_intensity < 0.01 & effsize_intensity > 0.8  ~ "continued production", 
+    #degradation:  p_intensity < 0.05, effsize_intensity < -0.5, (old lipid) p_enrich < 0.05, effsize_enrich > 0.5, (new lipid) p_enrich < 0.05, effsize_enrich < -0.5
+    p_intensity < 0.01 & effsize_intensity < -0.8  ~ "degraded", 
+    TRUE ~ "unclassified"
+  )
+) 
+#separated 
+compounds_classified_sep <- compound_stats_combined_sep %>% mutate(
+    classification = case_when(
+    #persistent: p_enrich > 0.05, abs(effsize_enrich) < 0.2, p_intensity > 0.05, abs(effsize_intensity) < 0.2
+    p_enrich > 0.01 & abs(effsize_enrich) < 0.2 & p_intensity > 0.01 & abs(effsize_intensity) < 0.2 ~ "persistent",
+    #continued production (labeled): p_intensity < 0.05, effsize_intensity > 0.5, p_enrich < 0.05, effsize_enrich > 0.5; effsize_intensity > 0.5, p_enrich < 0.05, effsize_enrich < -0.5 (unlabeled)
+    p_intensity < 0.01 & effsize_intensity > 0.8  ~ "continued production", 
+    #degradation:  p_intensity < 0.05, effsize_intensity < -0.5, (old lipid) p_enrich < 0.05, effsize_enrich > 0.5, (new lipid) p_enrich < 0.05, effsize_enrich < -0.5
+    p_intensity < 0.01 & effsize_intensity < -0.8  ~ "degraded", 
+    TRUE ~ "unclassified"
+  )
+) 
+```
+
+# Enrichment differences with site
+```{r}
+#perform t-test 
+compound_enrichment_ttest_site <- e_data_enrich_long_meta %>% 
+  select(c(Compound, TimePoint, Site, id, atomperc)) %>%
+  arrange(Compound, TimePoint, Site, id) %>%
+  group_by(Compound) %>%
+  t_test(atomperc ~ Site, paired = FALSE, var.equal = FALSE) %>%
+  add_significance(cutpoints = c(0, 1e-04, 0.001, 0.01, 0.1, 1),
+  symbols = c("****", "***", "**", "*", "ns"))
+    
+#calculate Cohen's d 
+compound_enrichment_cohens_site <- e_data_enrich_long_meta %>% 
+  select(c(Compound, TimePoint, Site, id, atomperc)) %>%
+  arrange(Compound, TimePoint, Site, id) %>%
+  group_by(Compound) %>%
+  cohens_d(atomperc ~ Site, paired = FALSE) %>%
+  add_significance(cutpoints = c(0, 1e-04, 0.001, 0.01, 0.1, 1),
+  symbols = c("****", "***", "**", "*", "ns"))
+
+#combine t-test and cohen's d outputs
+compound_enrichment_stats_site <- left_join(compound_enrichment_ttest_site, compound_enrichment_cohens_site)
+
+#reformat output for joining for intensity data 
+compound_enrichment_stats_rf_site <- compound_enrichment_stats_site %>% select(c(Compound, group1, group2, p, effsize)) %>% dplyr::rename("p_enrich" = "p") %>% dplyr::rename("effsize_enrich" = "effsize")
+```
+
+# Intensity differences with Site 
+```{r}
+#perform t-test
+compound_intensity_ttest_site <- e_data_long_meta  %>%
+  select(c(Compound, Site, TimePoint, id, log2_intensity)) %>%
+  arrange(Compound, TimePoint, Site, id) %>%
+  group_by(Compound) %>%
+  t_test(log2_intensity ~ Site, var.equal = FALSE) %>%
+  add_significance(cutpoints = c(0, 1e-04, 0.001, 0.01, 0.1, 1),
+  symbols = c("****", "***", "**", "*", "ns"))
+    
+#calculate Cohen's d 
+compound_intensity_cohens_site <- e_data_long_meta %>%
+  select(c(Compound, Site, TimePoint, id, log2_intensity)) %>%
+  arrange(Compound, Site, TimePoint, id) %>%
+  group_by(Compound) %>%
+ cohens_d(log2_intensity ~ Site, paired = FALSE) %>%
+  add_significance(cutpoints = c(0, 1e-04, 0.001, 0.01, 0.1, 1),
+  symbols = c("****", "***", "**", "*", "ns"))
+
+#combine t-test and cohen's d outputs
+compound_intensity_stats_site <- left_join(compound_intensity_ttest_site, compound_intensity_cohens_site)
+#reformat output for joining for intensity data 
+compound_intensity_stats_rf_site <- compound_intensity_stats_site %>% select(c(Compound, group1, group2, p, effsize)) %>% dplyr::rename("p_intensity" = "p") %>% dplyr::rename("effsize_intensity" = "effsize")
+```
+
+
+## Combine 
+```{r}
+compound_stats_combined_site <- left_join(compound_enrichment_stats_rf_site, compound_intensity_stats_rf_site) %>% distinct()
+
+#add categorical groupings 
+compounds_classified_site <- compound_stats_combined_site %>% mutate(
+  site_classification = case_when(
+    #both enrichment and intensity -> need to break down into sites further 
+    p_enrich < 0.05 & effsize_enrich > 0.2 & p_intensity < 0.05 & effsize_intensity > 0.2 ~ "Wisconsin enrichment and intensity",
+    p_enrich < 0.05 & effsize_enrich < -0.2 & p_intensity < 0.05 & effsize_intensity < -0.2 ~ "Michigan enrichment and intensity",
+    p_enrich < 0.05 & effsize_enrich > 0.2 & p_intensity < 0.05 & effsize_intensity < -0.2 ~ "Wisconsin enrichment and Michigan intensity",
+    p_enrich < 0.05 & effsize_enrich < -0.2 & p_intensity < 0.05 & effsize_intensity > 0.2 ~ "Michigan enrichment and Wisconsin intensity",
+    #enrichment 
+    p_enrich < 0.05 & effsize_enrich > 0.2  ~ "enrichment Wisconsin",
+    p_enrich < 0.05 & effsize_enrich < -0.2  ~ "enrichment Michigan",
+    #intensity 
+    p_intensity < 0.05 & effsize_intensity > 0.2  ~ "intensity Wisconsin",
+    p_intensity < 0.05 & effsize_intensity < 0.2  ~ "intensity Michigan",
+      TRUE ~ "unclassified"
+  )
+  )
+
+#add site classification to timepoint dataframe
+#unseparated
+all_classified <- left_join(compounds_classified, compounds_classified_site %>% select(c(Compound, site_classification)))
+#separated
+all_classified_sep <- left_join(compounds_classified_sep, compounds_classified_site %>% select(c(Compound, site_classification)))
+
+#summarized
+#not separated by site
+all_classified_summarized <- all_classified %>% 
+   group_by(Compound) %>%
+  mutate(
+    atomperc_avg = mean(atomperc, na.rm = TRUE), 
+    log2_intensity_avg = mean(log2_intensity, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  #need to pivot data to calculate ratio of intensities between timepoints 
+  group_by(Compound, TimePoint) %>%
+  mutate(
+    intensity_timepoint_avg = mean(log2_intensity, na.rm = TRUE),
+    atomperc_timepoint_avg = mean(atomperc, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+    pivot_wider(names_from = TimePoint, values_from = c(intensity_timepoint_avg, atomperc_timepoint_avg)) %>%
+  arrange(Compound, id) %>%
+  fill(intensity_timepoint_avg_1year, .direction = "down") %>%
+  fill(atomperc_timepoint_avg_1year, .direction = "down") %>%
+  fill(intensity_timepoint_avg_2month, .direction = "up") %>%
+  fill(atomperc_timepoint_avg_2month, .direction = "up") %>%
+  mutate(log2FC_intensity = intensity_timepoint_avg_2month - intensity_timepoint_avg_1year) %>%
+  select(c(Compound, group, atomperc_avg, log2_intensity_avg, log2FC_intensity, atomperc_timepoint_avg_1year, p_enrich, effsize_enrich, p_intensity, effsize_intensity, classification, site_classification)) %>% distinct()
+
+#separated by site
+all_classified_sep_summarized <- all_classified_sep %>% 
+   group_by(group, Compound, Site) %>%
+  mutate(
+    atomperc_avg = mean(atomperc, na.rm = TRUE), 
+    log2_intensity_avg = mean(log2_intensity, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  #need to pivot data to calculate ratio of intensities between timepoints 
+  group_by(group, Compound, Site, TimePoint) %>%
+  mutate(
+    intensity_timepoint_avg = mean(log2_intensity, na.rm = TRUE),
+    atomperc_timepoint_avg = mean(atomperc, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+    pivot_wider(names_from = TimePoint, values_from = c(intensity_timepoint_avg, atomperc_timepoint_avg)) %>%
+  arrange(Compound, id) %>%
+  fill(intensity_timepoint_avg_1year, .direction = "down") %>%
+  fill(atomperc_timepoint_avg_1year, .direction = "down") %>%
+  fill(intensity_timepoint_avg_2month, .direction = "up") %>%
+  fill(atomperc_timepoint_avg_2month, .direction = "up") %>%
+  mutate(log2FC_intensity = intensity_timepoint_avg_2month - intensity_timepoint_avg_1year) %>%
+  select(c(Compound, group, Site, atomperc_avg, log2_intensity_avg, log2FC_intensity, atomperc_timepoint_avg_1year, p_enrich, effsize_enrich, p_intensity, effsize_intensity, classification, site_classification)) %>% distinct()
+```
+
+# Create Heatmap Tables 
+
+# ComplexHeatmap Tables
+## Prepare dataframe for Complexheatmap
+```{r}
+#reorder data (MI switchgrass 2 month, MI switchgrass 1 year...then WI with same pattern)
+lipids_wmeta_ordered <- all_classified_summarized %>% select(c(Compound, group, classification, atomperc_avg, atomperc_timepoint_avg_1year, p_enrich, effsize_enrich, log2_intensity_avg, p_intensity, effsize_intensity, log2FC_intensity, site_classification)) %>% 
+#remove any rows with NA values 
+  na.omit() %>%
+  mutate(classification = factor(classification, levels = c("persistent", "continued production", "degraded",  "unclassified"))) %>%
+  group_by(classification, group) %>% arrange(classification, effsize_enrich) 
+#%>% mutate(atomperc_avg = atomperc_avg * 100, atomperc_avg_1year = atomperc_timepoint_avg_1year * 100)
+#sep
+#reorder data (MI switchgrass 2 month, MI switchgrass 1 year...then WI with same pattern)
+lipids_wmeta_ordered_sep <- all_classified_sep_summarized %>% select(c(Compound, group, classification, Site, atomperc_avg, atomperc_timepoint_avg_1year, p_enrich, effsize_enrich, log2_intensity_avg, p_intensity, effsize_intensity, log2FC_intensity, site_classification)) %>% 
+  dplyr::rename("site_desig" = "Site") %>%
+#remove any rows with NA values 
+  na.omit() %>%
+  mutate(classification = factor(classification, levels = c("persistent", "continued production", "degraded",  "unclassified"))) %>%
+  group_by(classification, group, site_desig) %>% arrange(classification, effsize_enrich) 
+
+#remove "unclassified"
+just_classified <- lipids_wmeta_ordered %>% filter(classification != "unclassified") 
+just_classified_sep <- lipids_wmeta_ordered_sep %>% filter(classification != "unclassified") 
+
+#row grouping vector
+classification = just_classified$classification
+classification_sep = just_classified_sep$classification
+```
+
+
+## Tables
+### Set colors
+```{r}
+col_atm_fun = circlize::colorRamp2(c(0, 0.015), c("white", "#FF7F00"))
+#col_atm <- col_atm_fun(seq(-0.5, 5))
+
+col_C_fun = circlize::colorRamp2(c(15, 20), c("white", "#E31A1C"))
+
+col_DBE_fun = circlize::colorRamp2(c(0, 4), c("white", "#1F78B4"))
+```
+
+
+### All subclassifications, no site specific stats
+```{r}
+#create df of just subclasses 
+lipidsub_wmeta_ordered <- lipids_wmeta_ordered %>% filter(group == "subclass") %>% 
+  #add back `Main class` column for color scheme
+  separate(Compound, c(NA, "Main class"), remove = FALSE)
+
+classification = lipidsub_wmeta_ordered$classification 
+
+#atom percent
+#matrix
+mat_atmperc <- as.matrix(lipidsub_wmeta_ordered$atomperc_timepoint_avg_1year)
+
+h_atmperc2 <- Heatmap(mat_atmperc, name = "EAF", row_split = lipidsub_wmeta_ordered$classification, col = col_atm_fun, row_title = NULL, column_title = expression(""^13*"C EAF"[year]), cluster_rows = FALSE, cluster_row_slices = FALSE, column_title_side = "bottom", width = unit(3, "cm"))
+
+#p value enrichment
+p_enrich = as.vector(lipidsub_wmeta_ordered$p_enrich)
+# label significant with asterisk
+is_sig = p_enrich < 0.01
+pch = rep("*", length(is_sig))
+pch[!is_sig] = NA
+# color mapping for -log10(pvalue)
+pvalue_col_fun = circlize::colorRamp2(c(0, 2, 3), c("#33A02C", "white", "#6A3D9A")) 
+ha2 = rowAnnotation(p = anno_simple(-log10(p_enrich), 
+        col = pvalue_col_fun, pch = pch), annotation_name_rot = 0)
+# generate two legends
+# legend for pvalue
+lgd_pvalue = Legend(title = "p-value", col_fun = pvalue_col_fun, at = c(0, 1, 2, 3), 
+    labels = c("1", "0.1", "0.01", "0.001"))
+# and one for the significant p-values
+lgd_sig = Legend(pch = "*", type = "points", labels = "< 0.01")
+
+
+#D value enrichment
+effsize_enrich = as.vector(lipidsub_wmeta_ordered$effsize_enrich)
+effsize_enrich <- round(effsize_enrich, digits = 1)
+ha1 = rowAnnotation("d" = anno_numeric(effsize_enrich, 
+        bg_gp = gpar(fill = ifelse(effsize_enrich > 0, "#33A02C", "#6A3D9A"), col = ifelse(effsize_enrich > 0, "#33A02C", "#6A3D9A"))), annotation_name_rot = 0)
+
+#intensity barplot
+ratio = as.vector(lipidsub_wmeta_ordered$log2FC_intensity)
+ha3 = rowAnnotation("Log2FC intensity" = anno_barplot(ratio, baseline = 0, gp = gpar(fill = "#1F78B4", col = "#1F78B4"), width = unit(3, "cm")))
+
+#p value intensity
+#p value enrichment
+p_intensity = as.vector(lipidsub_wmeta_ordered$p_intensity)
+# label significant with asterisk
+is_sig2 = p_intensity < 0.01
+pch2 = rep("*", length(is_sig2))
+pch2[!is_sig2] = NA
+
+ha5 = rowAnnotation(p = anno_simple(-log10(p_intensity), 
+        col = pvalue_col_fun, pch = pch2), annotation_name_rot = 0)
+
+#D value intensity 
+effsize_intensity = as.vector(lipidsub_wmeta_ordered$effsize_intensity)
+effsize_intensity <- round(effsize_intensity, digits = 1)
+ha4 = rowAnnotation("d" = anno_numeric(effsize_intensity, 
+        bg_gp = gpar(fill = ifelse(effsize_intensity > 0, "#33A02C", "#6A3D9A"), col = ifelse(effsize_intensity > 0, "#33A02C", "#6A3D9A"))), annotation_name_rot = 0)
+
+
+#Lipid type annotations 
+#vector for colors 
+class_colors <- lipidsub_wmeta_ordered %>% mutate(class_colors = case_when(
+  `Main class` == "DG" ~ "#FDBF6F",
+  `Main class` == "FA" ~ "#CAB2D6", 
+  `Main class` == "PC" ~ "#A6CEE3", 
+  `Main class` == "PE" ~ "#1F78B4", 
+  `Main class` == "PG" ~ "#B2DF8A", 
+  `Main class` == "PI" ~ "#33A02C", 
+  `Main class` == "TG" ~ "#FF7F00", 
+  `Main class` == "Cer" ~"#FB9A99", 
+  `Main class` == "DGTSA" ~ "#E31A1C",
+),
+class_colors = as.character(class_colors)) %>% ungroup() %>% select(c(class_colors, `Main class`)) 
+class_colors_vec = class_colors$class_colors
+
+class_colors_uniq = class_colors %>% distinct() %>% mutate(`Main class` = factor(`Main class`, levels = c("PC", "PE", "PG", "PI", "Cer", "DGTSA", "DG", "TG", "FA"))) %>% arrange(`Main class`)
+
+ha_lipid = rowAnnotation(
+  #class annotation 
+    Class = anno_text(lipidsub_wmeta_ordered$`Compound`, location = 0.5, just = "center", gp = gpar(fill = class_colors_vec, col = "white")))
+lgd_lipid = Legend(title = "Lipid class", legend_gp = gpar(fill = class_colors_uniq$class_colors),
+    labels = class_colors_uniq$`Main class`)
+
+#group by classification 
+ha_class <- rowAnnotation(Classification = classification, show_annotation_name = FALSE, show_legend = FALSE,
+    col = list(Classification = c("persistent" = "#CAB2D6", "continued production" = "#B2DF8A", "degraded" = "#A6CEE3", "unclassified" = "#F781BF")))
+#label classifications
+text_list = list(
+    text1 = "persistent",
+    text2 = "continued production",
+    text3 = "degraded", 
+    text4 = "unclassified"
+)
+ha_empty = rowAnnotation(foo = anno_empty(border = FALSE, 
+    width = unit(5, "mm")))
+        #,annotation_legend_param = list(
+            #classification = list(direction = "horizontal", title_position = "lefttop", nrow = 1)))
+
+
+draw(ha_empty + ha_class + ha_lipid + h_atmperc2 + ha1 + ha2 + ha3 + ha4 + ha5, annotation_legend_list = list(lgd_lipid, lgd_pvalue, lgd_sig), heatmap_legend_side = "right", annotation_legend_side = "right", merge_legends = TRUE)
+
+
+for(i in 1:4) {
+    decorate_annotation("foo", slice = i, {
+        grid.text(paste(text_list[[i]], collapse = "\n"), x = unit(5, "mm"), rot = 0, just = "right")
+    })
+}
+```
+
+

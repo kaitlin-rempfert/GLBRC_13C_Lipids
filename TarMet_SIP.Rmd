@@ -1,0 +1,562 @@
+---
+title: "TarMet_SIP"
+output: html_document
+date: '2022-11-01'
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#devtools::install_github("hcji/TarMet")
+library(TarMet)
+# load required packages
+library(tidyverse)
+library(ggplot2)
+library(stringi)
+library(xcms)
+library(IsoCorrectoR)
+library(rstatix)
+library(ggpubr)
+library(MSnbase)
+
+#import scripts here
+source(file.path("scripts", "XIC.R"))
+```
+
+
+## Import Data 
+```{r}
+#path to positive .mzXML files
+dda_folder_pos = "~/Documents/EC/data/incubation/lipidome/mzXML/positive/batch3_samples"
+#list all files inside specified folder
+rawfiles_pos <- list.files(dda_folder_pos, recursive = TRUE, full.names = TRUE, pattern = "\\.mzXML$")
+
+#load into TarMet
+samples_pos <- sapply(strsplit(rawfiles_pos, '/'), function(s) s[length(s)])
+rawDataset_pos <- lapply(rawfiles_pos, LoadData_KRR)
+
+#import metadata file 
+meta <- readxl::read_excel("incubation_metadata_w_qc.xlsx")
+#filter metadata to just batch 3
+meta_samp_pos <- meta %>% filter(batch == "3" & polarity == "positive") %>% filter(!is.na(site)) 
+#add columns to metadata
+meta_samp_pos <- meta_samp_pos %>% mutate(
+  #create label of labeled/unlabeled and rep (block)
+  label_group = ifelse(amendment == "13C_Gluc", "L", "U"),
+  label_group = paste0(label_group, block)
+)
+
+#create dataframe with file extensions and sample names
+pd_samp_pos <- data.frame(extension = rawfiles_pos, sample_name = basename(rawfiles_pos))
+#merge metadata with phenodata frame 
+pd_samp_pos <- left_join(meta_samp_pos, pd_samp_pos, by = "sample_name")
+#export ordered file list
+samps_pos <- as.vector(pd_samp_pos$extension)
+
+#load into xcms
+dda_data_pos <- readMSData(rawfiles_pos,  pdata = new("NAnnotatedDataFrame", pd_samp_pos), centroided = TRUE, mode = "onDisk")
+#set peak-picking parameters
+cwp <- CentWaveParam(A = 4.289723e-07, ppm=1, Instrument=2, peakwidth=c(2.5, 45), snthresh = 10, noise=10000, prefilter=c(3, 100000), firstBaselineCheck = FALSE, integrate=2)
+#pick peaks
+dda_data_peaks_pos <- findChromPeaks(dda_data_pos, param = cwp)
+```
+
+Custom script to load files
+```{r}
+LoadData_KRR <- function(filename)
+{
+  msobj <- openMSfile(filename,backend="pwiz")
+  peakInfo <- peaks(msobj)
+  headerInfo <- header(msobj)
+  whMS1 <- which(headerInfo$msLevel==1)
+  peakInfo <- peakInfo[whMS1]
+  
+  peakInfo <- lapply(peakInfo, function(spectrum) {
+    keep <- spectrum[,2] > 1e-6
+    output <- as.data.frame(spectrum[keep,,drop = FALSE])
+    colnames(output) <- c('mz','intensity')
+    return(output)
+  })
+  
+  scanTime <- round(headerInfo$retentionTime[whMS1],3)
+  # close(msobj)
+  
+  return(list(path=filename, times=scanTime, peaks = peakInfo))
+}
+```
+
+#create config file
+```{r}
+#import database of lipids identified in LIQUID
+batch3_LIQUID <- read.csv("output/LIQUID/pos_LIQUID_db.csv") %>% select(-X)
+
+### FOR EXTRACTING PEAK WIDTHS
+#pull out retention times 
+rt_targets_pos <- batch3_LIQUID %>% select(-c(Formula, Category, Adduct)) %>% dplyr::rename(compound = Compound) %>% mutate(rt_window = 30) 
+#extract peak intensity and retention time
+peak_param_pos <- extract_peak_param(rt_targets_pos, dda_data_peaks_pos)
+#convert intensity and retention time columns to class numeric for filtering
+peak_param_pos <- peak_param_pos %>% ungroup() %>% mutate(Intensity = as.numeric(as.character(Intensity)), RT = as.numeric(as.character(RT)), RT_width = as.numeric(as.character(RT_width)), compound = as.character(compound))
+#except for FA that vary significantly in RT, average RT; average RT_width for all
+peak_param_avg_pos <- peak_param_pos %>% group_by(compound) %>% mutate(
+  targetRtAxis = mean(RT, na.rm = TRUE) * 60,
+  RT_width = mean(RT_width, na.rm = TRUE)) %>% 
+  mutate(
+    targetRtLeft = targetRtAxis - RT_width/2,
+    targetRtRight = targetRtAxis + RT_width/2
+  ) %>% select(-c(RT_width, RT)) %>% 
+  #select more intense natural abundance peak to be used for quality checking
+  filter(amendment == "NA_Gluc") %>% select(-amendment) %>% group_by(compound) %>%
+  slice_max(Intensity) %>% select(-Intensity) #replace catalog_number where intensity is greatest with the index from the vector
+SampInd_pos <- samples_pos %>% as.data.frame() %>% mutate(sampleInd = row_number(), catalog_number = str_extract(., "[^_]+")) %>% select(-.)
+#rejoin
+peak_info_pos <- left_join(peak_param_avg_pos, SampInd_pos) %>% select(-c(catalog_number))
+
+#export chemical formulas from database
+batch3_db <- batch3_LIQUID %>% select(c(Compound, Formula, Adduct, mz_db)) %>% 
+  #string split the chemical formulas
+  mutate(
+    name=str_extract_all(Formula,"[A-Za-z]+"),
+    value=str_extract_all(Formula,"\\d+")
+    ) %>%
+   unnest() %>% spread(name,value = value, fill=0) 
+#add random string as Identifier 
+batch3_db$Identifier <- stringi::stri_rand_strings(length(unique(batch3_db$Compound)), 5, pattern = "[a-z]")
+
+#subtract adduct from chemical formula
+batch3_db_adductremoved <- batch3_db %>% mutate(
+  H = ifelse(Adduct == "[M+NH4]+", as.numeric(H) - 4, as.numeric(H) - 1), 
+  N = ifelse(Adduct == "[M+NH4]+", as.numeric(N) - 1, N), 
+  N = as.numeric(N), 
+  P = as.numeric(P),
+  Formula_no_adduct = case_when(
+    N != 0 & P != 0 ~ paste0("C", C, "H", H, "N", N, "O", O, "P", P),
+    N != 0 & P == 0 ~ paste0("C", C, "H", H, "N", N, "O", O),
+    N == 0 & P == 0 ~ paste0("C", C, "H", H, "O", O), 
+    TRUE ~ "formula error")
+)
+
+#create config file
+config_pos <- left_join(batch3_db_adductremoved, peak_info_pos, by = c("Compound" = "compound")) %>% mutate(adduct = ifelse(Adduct == "[M+NH4]+", "M+NH4", "M+H")) %>% select(c(Compound, Identifier, mz_db, Formula_no_adduct, adduct, targetRtAxis, targetRtLeft, targetRtRight, sampleInd, C)) %>% dplyr::rename("name" = "Compound", "mz" = "mz_db", "formula" = "Formula_no_adduct") %>% mutate(
+  rtmin = targetRtAxis - 60,
+  rtmax = targetRtAxis + 60,
+  ppm = 5, 
+  scale = 5, 
+  height = 1000, 
+  snr = 100, 
+  tracer_element = 'C',     # type of element
+  tracer_isotope = '13C',     # type of isotope tracer
+  tracer_number = round(as.numeric(C)*.5, 0)
+) %>% select(-C) %>% filter(name != "PC(20:4/20:5)") %>% filter(targetRtAxis != "NaN")
+
+saveRDS(config_pos, "output/TarMet/pos/config_pos_4_5_23.rds")
+```
+
+Function for running TarMet using a config file
+```{r}
+#function for running TarMet using a config file
+run_TarMet_fromconfig <- function(config, rawfiles, samples, rawDataset, file_extension) {
+  output_total = data.frame()
+  for (i in 1:nrow(config)){
+    # set global parameters
+      fineness <- 'Medium'
+      resolution <- 60000
+      shift <- 20  # parameter for alignment
+      segment <- 20 
+      # set the parameters for the specific metabolite
+      threshold <- 0.01
+      name <- config$name[i]
+      Identifier <- config$Identifier[i]
+      formula <- config$formula[i]
+      mz <- config$mz[i]
+      sampleInd <- config$sampleInd[i]
+      tracer_element <- config$tracer_element[i]
+      tracer_isotope <- config$tracer_isotope[i]
+      tracer_number <-  config$tracer_number[i]
+      targetRtAxis <- config$targetRtAxis[i]
+      targetRtLeft <- config$targetRtLeft[i]
+      targetRtRight <- config$targetRtRight[i]
+      adduct <- config$adduct[i]
+      ppm <- config$ppm[i] 
+      scale <- config$scale[i]
+      rtmin <- config$rtmin[i]
+      rtmax <- config$rtmax[i]
+      height <- config$height[i]
+      snr <- config$snr[i]
+      ## Calculate m/z
+       mzs <- getMzWithTracer(formula, adduct, tracer_element, tracer_isotope, tracer_number)
+      targetMzRanges <- getMzRanges(mzs, resolution=60000, ppm=ppm)   
+    ## Targeted EIC generation
+      targetEICs <- list()
+      rtranges <- c(rtmin, rtmax)
+      for (j in seq_along(rawfiles)){
+        targetEICs[[j]] <- getMzEICs(rawDataset[[j]], rtranges=rtranges,
+                                     mzranges=targetMzRanges, baseline=FALSE,
+                                     smooth=TRUE)
+        }
+    pattern <- getIsotopicPattern(formula, adduct, threshold = .01, resolution=60000)
+    theoretical <- as.numeric(pattern[,2])
+    targetPeaks <- getIsotopicPeaks(targetEICs[[sampleInd]], SNR.Th=snr, peakScaleRange=scale, peakThr=height, theoretical=theoretical, fineness=fineness)
+    #plot EICs
+    p1 <- plotEICs(targetEICs[[sampleInd]], targetPeaks)
+    cmp_name <- config$name[i]
+    file_name <- paste0(file_extension, "/EICs/", i, "_", config$Identifier[i], ".html")
+htmlwidgets::saveWidget(widget = p1, file = file_name, title = cmp_name)
+    #output peak info
+    outputPeakInfo <- targetPeaks$PeakInfo
+    ## Set peak bounds manually 
+    userInfo <- data.frame(Name='User', Position=targetRtAxis, Start=targetRtLeft, End=targetRtRight)
+    outputPeakInfo <- rbind(targetPeaks$PeakInfo[,1:ncol(userInfo)], userInfo)
+    ## Calculate peak area
+    userArea <- round(getArea(targetEICs[[sampleInd]], targetRtLeft, targetRtRight), 2)
+    outputPeakArea <- {
+      res <- targetPeaks$PeakArea
+      res <- cbind(rownames(res), res)
+      res <- cbind(res, userArea, round(userArea/sum(userArea),3))
+      colnames(res)[1] <- 'mzRange'
+      colnames(res)[(ncol(res)-1) : ncol(res)] <- c('User','Abundance')
+      res
+    }
+    ## Alignment
+    alignedEICs <- getAlignedEICs(targetEICs, sampleInd, shift, segment, align=TRUE)
+    WhtoPlot <- 1  # plot the M+1 feature of the targeted metabolite of all samples
+    EicstoPlot <- lapply(alignedEICs, function(eics){
+      eics[[WhtoPlot]]
+      })
+    names(EicstoPlot) <- samples
+    #plot alignments
+    p2 <- plotEICs(EicstoPlot, rtrange=c(outputPeakInfo$Start[WhtoPlot], outputPeakInfo$End[WhtoPlot]))
+file_name2 <- paste0(file_extension, "/alignment/", i, "_", config$Identifier[i], ".html")
+htmlwidgets::saveWidget(widget = p2, file = file_name2, title = cmp_name)
+## Compare Peak Areas between isotopic peaks
+whPeak <- which(outputPeakInfo$Name == 'User')
+outputSamplesArea <- getQuantifiedResult(alignedEICs, outputPeakInfo$Start[whPeak], outputPeakInfo$End[whPeak])
+colnames(outputSamplesArea) <- samples
+#plot isotope stack barplot
+p3 <- plotStackBar(outputSamplesArea)
+file_name3 <- paste0(file_extension, "/isotopestackbar/", i, "_", config$Identifier[i], ".html")
+htmlwidgets::saveWidget(widget = p3, file = file_name3, title = cmp_name)
+    measurements <- as.data.frame(outputSamplesArea) 
+    rownames(measurements) <- NULL
+    rownames(measurements) <- paste0(Identifier, "_", as.numeric(rownames(measurements)) - 1)
+    output_total <- rbind(output_total, measurements)
+  }
+  return(output_total)
+}
+```
+  
+## run TarMet
+```{r}
+measurements_pos <- run_TarMet_fromconfig(config = pos_config, rawfiles = rawfiles_pos, samples = samples_pos, rawDataset = rawDataset_pos, file_extension = "output/TarMet/pos/SIP/4_5_23")
+
+#manual inspect for max tracer_number (remove coeluting peaks) and update spreadsheet
+tracer_number_pos_upd <- readxl::read_excel("output/TarMet/pos/SIP_pos_tracer_number_upd.xlsx") %>% select(-c(`...1`, `...2`, `...3`, tracer_number))
+
+config_pos_upd <- cbind (pos_config, tracer_number_pos_upd) %>% select(-tracer_number) %>% dplyr::rename("tracer_number" = "tracer_number_upd") %>% filter(tracer_number > 2)
+
+measurements_pos_upd <- run_TarMet_fromconfig(config = config_pos_upd, rawfiles = rawfiles_pos, samples = samples_pos, rawDataset = rawDataset_pos, file_extension = "output/TarMet/pos/SIP/4_5_23")
+```
+
+
+## remove data for samples where monoisotopic peak is not detected
+```{r}
+measurements_pos_upd_filt <- measurements_pos_upd %>% rownames_to_column("samples") %>% separate(samples, c("Identifier", "Channel")) %>% group_by(Identifier) %>% rowwise() %>% mutate_at(vars(starts_with("EC")), funs((case_when(Channel == 0 & . < 10000 ~ 0, TRUE ~ .)))) %>% mutate(samples = paste0(Identifier, "_", Channel)) %>% ungroup() %>% select(-c(Identifier, Channel)) %>% column_to_rownames("samples")
+```
+
+## prepare for IsoCorrectoR
+```{r}
+#measurement file
+measurements_pos_file <- measurements_pos_upd_filt %>% rownames_to_column("Measurements/Samples")
+write.csv(x = measurements_pos_file, file = "output/TarMet/pos/measurements_file_4_23.csv", quote = FALSE, row.names = FALSE, na = "")
+
+#molecule file
+#make molecules file (will need to subset)
+molecules_pos <- batch3_db %>% select(c(Identifier, Formula, C)) %>% dplyr::rename(Molecule = Identifier) %>% mutate(Formula = paste0(Formula, "LabC", C)) %>% select(Molecule, Formula) %>% mutate(MS = "") %>%
+  setNames(c("Molecule", "MS ion or MS/MS product ion", "MS/MS neutral loss")) 
+write.csv(x = molecules_pos, file = "output/TarMet/pos/molecule_file_4_23.csv", quote = FALSE, row.names = FALSE, na = "")
+
+#make key for molecules file
+key_pos <- batch3_db %>% select(Identifier, Compound)
+write.csv(x = key_pos, file = "output/TarMet/pos/key_pos_4_23.csv", quote = FALSE, row.names = FALSE, na = "")
+```
+
+## Process data through IsoCorrectoR
+```{r}
+IsoCorrection(MeasurementFile = "output/TarMet/pos/measurements_file_4_23.csv", 
+              ElementFile = "output/TarMet/pos/element_file.csv", 
+              MoleculeFile = "output/TarMet/pos/molecule_file_4_23.csv",
+              CorrectTracerImpurity = TRUE, CorrectTracerElementCore = TRUE, 
+              CalculateMeanEnrichment = TRUE, UltraHighRes = FALSE, 
+              DirOut = 'output/IsoCorrectoR/pos', 
+              FileOut = 'result', 
+              FileOutFormat = 'csv', 
+              ReturnResultsObject = TRUE, CorrectAlsoMonoisotopic = FALSE, 
+              CalculationThreshold = 10^-10, 
+              CalculationThreshold_UHR = 8, 
+              verbose = TRUE, Testmode = FALSE)
+```
+
+
+### Calculate paired rep (labeled vs unlabeled) relative mean enrichment & implement paired t-test with Cohen's D 
+```{r}
+#read in data from IsoCorrectoR
+isoR_enrich_pos <- read.csv("output/IsoCorrectoR/pos/2023-05-02_170737/IsoCorrectoR_result_MeanEnrichment.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+#Manipulate data into long format
+isoR_enrich_long_pos <- tidyr::pivot_longer(data = isoR_enrich_pos, cols = starts_with("EC"), names_to = "sample_name", values_to = "mean.enrichment") %>% dplyr::rename(Identifier = X)
+#join with metadata
+isoR_enrich_long_pos <- left_join(isoR_enrich_long_pos, meta_samp_pos) %>%
+#join with key to get compound names
+left_join(key_pos) %>%
+#add column "Label" to indicate labeling treatment (unlabeled vs labeled) and "Rep" with the rep #
+mutate(Label = ifelse(grepl("L", label_group), "labeled", "unlabeled"), Rep = readr::parse_number(as.character(block)), Label = as.factor(Label))
+saveRDS(isoR_enrich_long_pos, "output/isoR_enrich_long_pos_4_23.RDS")
+
+#need to filter out reps that don't have compound detected in labeled and unlabeled as well as compounds that only show up in one paired rep
+isoR_enrich_long_pos_filt <- isoR_enrich_long_pos %>% group_by(group, Identifier, Compound, Rep) %>% mutate(n = n()) %>% filter(n == 2) %>% ungroup() %>% group_by(group, Identifier, Compound) %>% mutate(n2 = n()) %>% filter(n2 > 2) %>% ungroup() %>% select(c(group, Identifier, Compound, mean.enrichment, Label, Rep))
+
+#paired t-test
+t_test_pos <- isoR_enrich_long_pos_filt %>%
+  group_by(group, Identifier, Compound) %>%
+  t_test(mean.enrichment ~ Label, paired = TRUE, detailed = TRUE) %>%
+  add_significance() 
+  
+#calculate effect size (Cohen's D)
+cohens_d_pos <- isoR_enrich_long_pos_filt %>% 
+  group_by(group, Identifier, Compound) %>%
+  cohens_d(mean.enrichment ~ Label, paired = TRUE)
+
+#calculate relative enrichment between unlabeled and labeled reps
+rel_enrich_pos <- isoR_enrich_long_pos_filt %>%
+  group_by(group, Identifier, Compound, Rep) %>% 
+  pivot_wider(names_from = Label, values_from = mean.enrichment) %>% 
+  summarise(labeled = dplyr::first(na.omit(labeled)),
+      unlabeled = dplyr::first(na.omit(unlabeled))) %>%
+  mutate(rel_enrichment = labeled - unlabeled) %>%
+#calculate mean + sd enrichment difference between unlabeled and labeled rep pairs
+  group_by(group, Identifier, Compound) %>% 
+  mutate(mean_rel_enrichment = mean(rel_enrichment), 
+         sd_rel_enrichment = sd(rel_enrichment), Rep =Rep)
+
+#combine
+pos_SIP <- left_join(t_test_pos, cohens_d_pos) %>% left_join(rel_enrich_pos)
+saveRDS(pos_SIP, "output/pos_SIP_4_23.RDS" )
+```
+
+
+
+#NEGATIVE
+
+## Import Data 
+```{r}
+#path to .mzXML files
+dda_folder_neg = "/Users/remp858/Documents/EC/data/incubation/lipidome/mzXML/negative/batch4_samples"
+#list all files inside specified folder
+rawfiles_neg <- list.files(dda_folder_neg, recursive = TRUE, full.names = TRUE, pattern = "\\.mzXML$")
+
+#load into TarMet
+samples_neg <- sapply(strsplit(rawfiles_neg, '/'), function(s) s[length(s)])
+rawDataset_neg <- lapply(rawfiles_neg, LoadData_KRR)
+
+####DO NOT NEED THIS BELOW UNLESS EXTRACTING PEAK PARAMETERS
+#load into xcms
+#import metadata file 
+meta <- readxl::read_excel("incubation_metadata_w_qc.xlsx")
+#filter metadata to just batch 3
+meta_samp_neg <- meta %>% filter(batch == "4" & polarity == "negative") %>% filter(!is.na(site)) 
+#add columns to metadata
+meta_samp_neg <- meta_samp_neg %>% mutate(
+  #create label of labeled/unlabeled and rep (block)
+  label_group = ifelse(amendment == "13C_Gluc", "L", "U"),
+  label_group = paste0(label_group, block)
+)
+#create dataframe witg file extensions and sample names
+pd_samp_neg <- data.frame(extension = rawfiles_neg, sample_name = basename(rawfiles_neg))
+#merge metadata with phenodata frame 
+pd_samp_neg <- left_join(meta_samp_neg, pd_samp_neg, by = "sample_name")
+#export ordered file list
+samps_neg <- as.vector(pd_samp_neg$extension)
+
+#load data 
+dda_data_neg <- readMSData(samps_neg,  pdata = new("NAnnotatedDataFrame", pd_samp_neg), centroided = TRUE, mode = "onDisk")
+
+#set peak-picking parameters
+cwp <- CentWaveParam(ppm=1, peakwidth=c(2.5, 45), snthresh = 10, noise=10000, prefilter=c(3, 100000), firstBaselineCheck = FALSE, integrate=2)
+#pick peaks
+dda_data_peaks_neg <- findChromPeaks(dda_data_neg, param = cwp)
+```
+
+#create config file
+```{r}
+#import database of lipids identified in LIQUID
+batch4_LIQUID <- read.csv("output/LIQUID/neg_LIQUID_db.csv") 
+#import FA database
+FA <- readxl::read_xlsx("output/LIQUID/fatty_acids.xlsx") %>% mutate(Category = "Fatty Acyls [FA]", Adduct = "[M-H]-") %>% dplyr::rename("Compound" = "compound")
+#bind together databases
+batch4_LIQUID <- rbind(batch4_LIQUID, FA)
+
+### FOR EXTRACTING PEAK WIDTHS
+#pull out retention times 
+rt_targets_neg <- batch4_LIQUID %>% select(-c(Formula, Category, Adduct)) %>% dplyr::rename(compound = Compound) %>% mutate(rt_window = ifelse(grepl("FA", compound), 80, 30))
+#extract peak intensity and retention time
+peak_param_neg <- extract_peak_param(rt_targets_neg, dda_data_peaks_neg)
+#convert intensity and retention time columns to class numeric for filtering
+peak_param_neg <- peak_param_neg %>% ungroup() %>% mutate(Intensity = as.numeric(as.character(Intensity)), RT = as.numeric(as.character(RT)), RT_width = as.numeric(as.character(RT_width)), compound = as.character(compound))
+#except for FA that vary significantly in RT, average RT; average RT_width for all
+peak_param_avg_neg <- peak_param_neg  %>% group_by(compound) %>% mutate(
+  targetRtAxis = mean(RT, na.rm = TRUE) * 60,
+  RT_width = mean(RT_width, na.rm = TRUE)) %>% 
+  mutate(
+    targetRtLeft = targetRtAxis - RT_width/2,
+    targetRtRight = targetRtAxis + RT_width/2
+  ) %>% #select more intense natural abundance peak to be used for quality checking
+  filter(amendment == "NA_Gluc") %>% select(-amendment) %>% group_by(compound) %>%
+  slice_max(Intensity) %>% select(-Intensity) #replace catalog_number where intensity is greatest with the index from the vector
+SampInd_neg <- samples_neg %>% as.data.frame() %>% mutate(sampleInd = row_number(), catalog_number = str_extract(., "[^_]+")) %>% select(-.) #replace catalog_number where intensity is greatest with the index from the vector
+peak_info_neg <- left_join(peak_param_avg_neg, SampInd_neg) %>% select(-catalog_number)
+
+#export chemical formulas from database
+batch4_db <- batch4_LIQUID %>% select(c(Compound, Formula, Adduct, mz_db)) %>%  #string split the chemical formulas
+  mutate(
+    name=str_extract_all(Formula,"[A-Za-z]+"),
+    value=str_extract_all(Formula,"\\d+")
+    ) %>% unnest() %>% spread(name,value=value, fill=0)
+#add random string as Identifier 
+batch4_db$Identifier <- stringi::stri_rand_strings(length(unique(batch4_db$Compound)), 5, pattern = "[a-z]")
+
+#subtract adduct from chemical formula
+batch4_db_adductremoved <- batch4_db %>% mutate(
+  H = as.numeric(H) + 1, 
+  Formula_no_adduct = case_when(
+    N != 0 & P != 0 ~ paste0("C", C, "H", H, "N", N, "O", O, "P", P),
+    N != 0 & P == 0 ~ paste0("C", C, "H", H, "N", N, "O", O),
+    N == 0 & P == 0 ~ paste0("C", C, "H", H, "O", O), 
+    N == 0 & P != 0 ~ paste0("C", C, "H", H, "O", O, "P", P),
+    TRUE ~ "formula error")
+)
+
+#create config file
+config_neg <- left_join(batch4_db_adductremoved, peak_info_neg, by = c("Compound" = "compound")) %>% mutate(adduct = "M-H") %>% select(c(Compound, Identifier, mz_db, Formula_no_adduct, adduct, targetRtAxis, targetRtLeft, targetRtRight, sampleInd, C)) %>% dplyr::rename("name" = "Compound", "formula" = "Formula_no_adduct","mz" = "mz_db") %>% mutate(
+  rtmin = targetRtAxis - 60,
+  rtmax = targetRtAxis + 60,
+  ppm = 10, 
+  scale = 5, 
+  height = 100, 
+  snr = 10, 
+  tracer_element = 'C',     # type of element
+  tracer_isotope = '13C',     # type of isotope tracer
+  tracer_number = round(as.numeric(C)*.5, 0)
+) %>% select(-C) %>% filter(targetRtAxis != "NaN") 
+
+#saveRDS(config_neg, "output/TarMet/neg/config_neg_4_5_23.rds")
+```
+
+## run TarMet
+```{r}
+measurements_neg <- run_TarMet_fromconfig(config = config_neg, rawfiles = rawfiles_neg, samples = samples_neg, rawDataset = rawDataset_neg, file_extension = "output/neg/SIP/4_23")
+
+tracer_number_upd <- readxl::read_excel("output/TarMet/neg/SIP_neg_tracer_number_upd.xlsx") %>% select(-c(`...1`, name, Identifier, tracer_number))
+
+config_neg_upd <- cbind (config_neg, tracer_number_upd) %>% select(-tracer_number) %>% dplyr::rename("tracer_number" = "tracer_number_upd") %>% filter(tracer_number > 2)
+
+measurements_neg_upd <- run_TarMet_fromconfig(config = config_neg_upd, rawfiles = rawfiles_neg, samples = samples_neg, rawDataset = rawDataset_neg, file_extension = "output/neg/SIP/4_23")
+```
+
+## remove data for samples where monoisotopic peak is not detected
+```{r}
+measurements_neg_upd_filt_1 <- measurements_neg_upd %>% rownames_to_column("samples") %>% separate(samples, c("Identifier", "Channel")) %>% group_by(Identifier) %>% rowwise() %>% mutate_at(vars(starts_with("EC")), funs((case_when(Channel == 0 & . < 10000 ~ 0, TRUE ~ .)))) %>% mutate(samples = paste0(Identifier, "_", Channel)) %>% ungroup() %>% select(-c(Identifier, Channel)) %>% column_to_rownames("samples")
+```
+
+## prepare for IsoCorrectoR
+```{r}
+#measurement file
+measurements_neg_file <- measurements_neg_upd_filt_1 %>% rownames_to_column("Measurements/Samples")
+write.csv(x = measurements_neg_file, file = "output/neg/measurements_file_4_23.csv", quote = FALSE, row.names = FALSE, na = "")
+
+#molecule file
+#make molecules file (will need to subset)
+molecules_neg <- batch4_db %>% select(c(Identifier, Formula, C)) %>% dplyr::rename(Molecule = Identifier) %>% mutate(Formula = paste0(Formula, "LabC", C)) %>% select(Molecule, Formula) %>% mutate(MS = "") %>%
+  setNames(c("Molecule", "MS ion or MS/MS product ion", "MS/MS neutral loss")) 
+write.csv(x = molecules_neg, file = "output/neg/molecule_file_4_23.csv", quote = FALSE, row.names = FALSE, na = "")
+
+#make key for molecules file
+key_neg <- batch4_db %>% select(Identifier, Compound)
+#write.csv(x = key_neg, file = "output/neg/key_neg_4_23.csv", quote = FALSE, row.names = FALSE, na = "")
+```
+
+## Process data through IsoCorrectoR
+```{r}
+IsoCorrection(MeasurementFile = "output/TarMet/neg/measurements_file_4_23.csv", 
+              ElementFile = "output/TarMet/neg/element_file.csv", 
+              MoleculeFile = "output/TarMet/neg/molecule_file_4_23.csv",
+              CorrectTracerImpurity = TRUE, CorrectTracerElementCore = TRUE, 
+              CalculateMeanEnrichment = TRUE, UltraHighRes = FALSE, 
+              DirOut = 'output/IsoCorrectoR/neg', 
+              FileOut = 'result', 
+              FileOutFormat = 'csv', 
+              ReturnResultsObject = TRUE, CorrectAlsoMonoisotopic = FALSE, 
+              CalculationThreshold = 10^-10, 
+              CalculationThreshold_UHR = 8, 
+              verbose = TRUE, Testmode = FALSE)
+```
+
+### Calculate paired rep (labeled vs unlabeled) relative mean enrichment & implement paired t-test with Cohen's D 
+```{r}
+#read in data from IsoCorrectoR
+isoR_enrich_neg <- read.csv("output/neg/IsoCorrectoR/neg/2023-05-02_183514/IsoCorrectoR_result_MeanEnrichment.csv", header = TRUE, sep = ",", quote = "\"", na.strings = "NA")
+#Manipulate data into long format
+isoR_enrich_long_neg <- tidyr::pivot_longer(data = isoR_enrich_neg, cols = starts_with("EC"), names_to = "sample_name", values_to = "mean.enrichment") %>% dplyr::rename(Identifier = X)
+#join with metadata
+isoR_enrich_long_neg <- left_join(isoR_enrich_long_neg, meta_samp_neg) %>%
+#join with key to get compound names
+left_join(key_neg) %>%
+#add column "Label" to indicate labeling treatment (unlabeled vs labeled) and "Rep" with the rep #
+mutate(Label = ifelse(grepl("L", label_group), "labeled", "unlabeled"), Rep = readr::parse_number(as.character(block)), Label = as.factor(Label))
+saveRDS(isoR_enrich_long_neg, "output/isoR_enrich_long_neg_4_23.RDS")
+
+#need to filter out reps that don't have compound detected in labeled and unlabeled as well as compounds that only show up in one paired rep
+isoR_enrich_long_neg_filt <- isoR_enrich_long_neg %>% group_by(group, Identifier, Compound, Rep) %>% mutate(n = n()) %>% filter(n == 2) %>% ungroup() %>% group_by(group, Identifier, Compound) %>% mutate(n2 = n()) %>% filter(n2 > 2) %>% ungroup() %>% select(c(group, Identifier, Compound, mean.enrichment, Label, Rep))
+
+#paired t-test
+t_test_neg <- isoR_enrich_long_neg_filt %>%
+  group_by(group, Identifier, Compound) %>%
+  t_test(mean.enrichment ~ Label, paired = TRUE, detailed = TRUE) %>%
+  add_significance() 
+  
+#calculate effect size (Cohen's D)
+cohens_d_neg <- isoR_enrich_long_neg_filt %>% 
+  group_by(group, Identifier, Compound) %>%
+  cohens_d(mean.enrichment ~ Label, paired = TRUE)
+
+#calculate relative enrichment between unlabeled and labeled reps
+rel_enrich_neg <- isoR_enrich_long_neg_filt %>%
+  group_by(group, Identifier, Compound, Rep) %>% 
+  pivot_wider(names_from = Label, values_from = mean.enrichment) %>% 
+  summarise(labeled = dplyr::first(na.omit(labeled)),
+      unlabeled = dplyr::first(na.omit(unlabeled))) %>%
+  mutate(rel_enrichment = labeled - unlabeled) %>%
+#calculate mean + sd enrichment difference between unlabeled and labeled rep pairs
+  group_by(group, Identifier, Compound) %>% 
+  mutate(mean_rel_enrichment = mean(rel_enrichment), 
+         sd_rel_enrichment = sd(rel_enrichment), Rep = Rep)
+
+#combine
+neg_SIP <- left_join(t_test_neg, cohens_d_neg) %>% left_join(rel_enrich_neg)
+saveRDS(neg_SIP, "output/neg_SIP_4_23.RDS" )
+```
+
+
+```{r}
+combined_SIP <- rbind(pos_SIP, neg_SIP)
+saveRDS(combined_SIP, "output/combined_SIP_4_23.RDS")
+
+combined_rel_enrich <- rbind(rel_enrich_pos, rel_enrich_neg)
+saveRDS(combined_rel_enrich, "output/combined_rel_enrich_4_23.RDS" )
+```
+
+
+```{r}
+uniq_sig_intact <- rbind(t_test_pos, t_test_neg) %>% filter(p.signif != "ns" & estimate > 0) %>% select(Compound) %>% distinct()
+```
+

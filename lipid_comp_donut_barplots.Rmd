@@ -1,0 +1,227 @@
+---
+title: "Lipid composition (by count, not abundance)"
+author: "Kaitlin Rempfert"
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+output:
+  html_document: 
+    df_print: paged 
+    number_sections: yes 
+    css: stylesheet.css 
+    toc: yes 
+    toc_float: true 
+    toc_depth: 3 
+    code_folding: show 
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r setup, echo = TRUE, message=FALSE, warning=FALSE}
+# clear workspace
+# WS = c(ls())
+# rm(WS, list = WS)
+
+# load required packages
+library(tidyverse)
+library(Rodin)
+library(ggplot2)
+library(vegan)
+library(ggvegan)
+library(knitr)
+library(readxl)
+library(ggiraphExtra)
+library(ggpubr)
+
+knitr::opts_chunk$set(echo = TRUE, cache = F)
+```
+
+
+# Import Data
+```{r}
+#read in lipid data from pmartR (use input files since we want all compounds before abundance filtering)
+mylipidData <- readRDS("output/pmartR/mylipidData.rds")
+```
+
+
+# Intact Lipids
+
+# Pull out data from LipidObject
+```{r}
+#pull out e_meta
+lipid_meta <- mylipidData[["e_meta"]]
+
+#add classification data from Rodin
+targets <- lipid_meta %>%  dplyr::rename("Lipid" = "Compound") %>% mutate(Lipid = str_remove_all(Lipid, "mylipidData_neg_"))
+#Query <- targets$Lipid
+#for lipid isomers separated by ";", split into separate rows
+targets_subset <- targets %>% filter(grepl(";", Lipid, fixed = TRUE))
+out <- do.call(rbind, Map(cbind, strsplit(targets_subset$Lipid, ";"), targets_subset$mz_db, targets_subset$rt_db)) %>% as.data.frame() %>% dplyr::rename("mz_db" = "V2", "Lipid_sep" = "V1", "rt_db" = "V3") %>% mutate(mz_db = as.numeric(mz_db), rt_db = as.numeric(rt_db))
+#rejoin subsetted lipids with lipids in target list
+targets_subsetted <- left_join(targets, out) %>% mutate(Lipid_sep = case_when(
+  is.na(Lipid_sep) ~ Lipid,
+  TRUE ~ Lipid_sep
+))
+#pull out lipid names from target list for querying
+targets_subsetted_query <- targets_subsetted %>% select(Lipid_sep) %>% distinct()
+Query <- targets_subsetted_query$Lipid_sep
+#clean query list
+#cleaned.query <- clean.lipid.list(Query)
+
+#mine
+lipid.miner(Query, name="Query", TGcollapse.rm = TRUE)
+
+#necessary output is Query.intact, Query.allchains
+
+```
+
+## Donut-Pie chart
+```{r}
+meta_rodin <- left_join(targets_subsetted, Query.intact, by = c("Lipid_sep" = "Lipid")) 
+meta_rodin_sep <- meta_rodin %>% select(-c(Lipid, rt_db)) %>%
+distinct()
+meta_rodin_no_sep <- meta_rodin %>% select(c(1:6, 8:12)) %>% distinct()
+
+meta_rodin_sep_taxonomy <- meta_rodin_sep %>% mutate(
+  Lipid_class = case_when(
+  grepl("DGTSA", Lipid_sep) ~ "Glycerolipid",  
+  grepl("FA", Lipid_sep) ~ "Fatty acyls",
+  grepl("Hydroxy", Lipid_sep) ~ "Fatty acyls",
+  TRUE ~ `Category.y`
+  ),
+  Lipid_subclass = case_when(
+  `Sub class` == "Cer(d" ~ "Cer",
+  `Sub class` == "Cer(d<hydroxy>" ~ "Cer-OH",
+  `Sub class` == "CoQ(" ~ "CoQ",
+  `Main class` == "DG" ~ "DG",
+   grepl("DGTSA", Lipid_sep) ~ "DGTSA",
+  `Sub class` == "LPC(" ~ "LPL",
+  `Sub class` == "PC(" ~ "PC",
+  `Sub class` == "PE(" ~ "PE",
+  `Sub class` == "LPE(" ~ "LPL",
+  `Sub class` == "PE(O-" ~ "etherPL",
+  `Sub class` == "PE(P-" ~ "etherPL",
+  `Sub class` == "LPG(" ~ "LPL",
+  `Sub class` == "PG(" ~ "PG",
+  `Sub class` == "PG(O-" ~ "etherPL",
+  `Sub class` == "PI(" ~ "PI",
+  grepl("FA", Lipid_sep) ~ "FA",
+  grepl("Hydroxy", Lipid_sep) ~ "FA-OH",
+  `Main class` == "TG" ~ "TG",
+  TRUE ~ "Other"
+)) %>% select(c(Lipid_sep, Lipid_class, Lipid_subclass))
+
+meta_rodin_taxonomy <- meta_rodin_no_sep %>% mutate(
+  Lipid_class = case_when(
+  grepl("DGTSA", Lipid) ~ "Glycerolipid",  
+  grepl("FA", Lipid) ~ "Fatty acyls",
+  grepl("Hydroxy", Lipid) ~ "Fatty acyls",
+  TRUE ~ `Category.y`
+  ),
+  Lipid_subclass = case_when(
+  `Sub class` == "Cer(d" ~ "Cer",
+  `Sub class` == "Cer(d<hydroxy>" ~ "Cer-OH",
+  `Sub class` == "CoQ(" ~ "CoQ",
+  `Main class` == "DG" ~ "DG",
+   grepl("DGTSA", Lipid) ~ "DGTSA",
+  `Sub class` == "LPC(" ~ "LPL",
+  `Sub class` == "PC(" ~ "PC",
+  `Sub class` == "PE(" ~ "PE",
+  `Sub class` == "LPE(" ~ "LPL",
+  `Sub class` == "PE(O-" ~ "etherPL",
+  `Sub class` == "PE(P-" ~ "etherPL",
+  `Sub class` == "LPG(" ~ "LPL",
+  `Sub class` == "PG(" ~ "PG",
+  `Sub class` == "PG(O-" ~ "etherPL",
+  `Sub class` == "PI(" ~ "PI",
+  grepl("FA", Lipid) ~ "FA",
+  grepl("Hydroxy", Lipid) ~ "FA-OH",
+  `Main class` == "TG" ~ "TG",
+  TRUE ~ "Other"
+)) %>% select(c(Lipid, Lipid_class, Lipid_subclass))
+
+PD <- meta_rodin_taxonomy %>% mutate(Freq = 1) %>% group_by(Lipid_class, Lipid_subclass) %>% summarise(n = sum(Freq))
+print(PD)
+
+PD_class <- meta_rodin_taxonomy %>% mutate(Freq = 1)  %>% group_by(Lipid_class) %>% summarise(n = sum(Freq))
+print(PD_class)
+
+PD_counts <- PD %>% mutate(Lipid_class_new = case_when(
+  Lipid_class == "Fatty acyls" ~ "Fatty acyls (12)", 
+  Lipid_class == "Glycerolipid" ~ "Glycerolipids (175)",
+  Lipid_class == "Glycerophospholipid" ~ "Glycerophospholipids (119)",
+  Lipid_class == "Prenol" ~ "Prenols (1)",
+  Lipid_class == "Sphingolipid" ~ "Sphingolipids (19)", 
+  TRUE ~ "other"
+),
+  Lipid_subclass_new = paste0(Lipid_subclass, " (", n, ")"))
+
+p <- PieDonut(PD_counts, aes(Lipid_class_new, Lipid_subclass_new, count=n), showRatioPie = FALSE, showRatioDonut = FALSE, showRatioThreshold = .001)
+
+PD_2 <- left_join(meta_rodin_taxonomy, PD_counts) %>% select(-n) %>% select(-c(Lipid_class_new, Lipid_subclass)) %>% filter(Lipid_class != "Prenol") %>% mutate(Lipid_subclass_new_f = factor(Lipid_subclass_new))
+#, levels = c("FA (9)", "FA-OH (3)", "DG (23)", "TG (183)", "DGTSA (7)",  "LPC (3)", "PC (30)",  "LPE (2)", "PE (44)", "PE-O (6)", "PE-P (1)", "LPG (1)", "PG (32)", "PG-O (1)", "PI (7)",  "Cer (13)", "Cer-OH (6)")))
+
+pie <- ggPieDonut(PD_2,aes(pies=Lipid_class,donuts=Lipid_subclass_new_f), interactive=FALSE, showRatioDonut = TRUE,
+  showRatioPie = FALSE)
+
+ggPieDonut(PD_2,aes(pies=Lipid_class,donuts=Lipid_subclass_new_f), interactive=TRUE, showRatioDonut = FALSE,
+  showRatioPie = FALSE)
+
+pd_palette = c("#FF0000FF", "#80FF00FF", "#00FFFFFF", "#8000FFFF")
+```
+
+## Pie Donut by peak area 
+```{r}
+lipidomics_samples_sep_corrected <- readRDS("output/lipidomics_samples_sep_corrected.RDS")
+
+lipidomics_samples_sep_corrected_avg <- lipidomics_samples_sep_corrected %>% rowwise() %>% 
+    mutate(avg_peak_area = mean(c_across(starts_with("EC")), na.rm = TRUE)) %>% select(-c(starts_with("EC")))
+
+lipidomics_avg_sep_taxonomy <- left_join(lipidomics_samples_sep_corrected_avg, meta_rodin_sep_taxonomy)
+
+PD <- lipidomics_avg_sep_taxonomy %>% group_by(Lipid_class, Lipid_subclass) %>% summarise(n = sum(avg_peak_area))
+print(PD)
+
+PD_class <- lipidomics_avg_sep_taxonomy %>% group_by(Lipid_class) %>% summarise(n = sum(avg_peak_area))
+print(PD_class)
+
+ggPieDonut(lipidomics_avg_sep_taxonomy %>% filter(Lipid_class != "Prenol"),aes(pies=Lipid_class,donuts=Lipid_subclass), interactive=FALSE, showRatioDonut = TRUE,
+  showRatioPie = FALSE)
+```
+
+
+## Bar plots by class
+```{r}
+#remove "_chain" and everything after
+Query.allchains_g <- Query.allchains %>% mutate(Lipid_f = gsub("_Chain1", "", fixed = TRUE, .$Lipid)) %>% mutate(Lipid_f = gsub("_Chain2", "", fixed = TRUE, .$Lipid_f)) %>% mutate(Lipid_f = gsub("_Chain3", "", fixed = TRUE, .$Lipid_f)) %>% mutate(Lipid_f = gsub("_Chain4", "", fixed = TRUE, .$Lipid_f)) %>% mutate(Chain = gsub("<hydroxy>", "-OH", fixed = TRUE, .$Chain)) %>% select(-Lipid) %>% dplyr::rename("Lipid" = "Lipid_f") %>% mutate(Chain = case_when(
+  #grepl("HydroxyphthioceranicAcid", Lipid) ~ paste0(Chain, "-OH"),
+  grepl("d", Chain) ~ gsub("d", "", .$Chain),
+  TRUE ~ Chain
+))
+
+#join with intact data to get chain breakdown by class
+meta_rodin_chains <- left_join(Query.allchains_g, lipidomics_avg_sep_taxonomy, by = c("Lipid" = "Lipid_sep"), relationship = "many-to-many") %>% group_by(Lipid_class) %>% mutate(n = sum(avg_peak_area)) %>% ungroup() %>% group_by(Chain, Lipid_class) %>% mutate(n2 = sum(avg_peak_area), proportion = n2/n, Chain = factor(Chain), Lipid_class = factor(Lipid_class)) %>% select(c(Chain, Lipid_class, proportion)) %>% distinct()
+
+#expand dataframe to include proportions of 0 for non-detected chains
+meta_rodin_chains_expanded <- left_join(expand_grid(Chain = unique(meta_rodin_chains$Chain), Lipid_class = unique(meta_rodin_chains$Lipid_class)), meta_rodin_chains) %>% mutate(proportion = replace_na(proportion, 0)) %>% dplyr::rename("Lipid type" = "Lipid_class")
+
+#graph chains
+bp1 <- meta_rodin_chains_expanded %>% ggbarplot(x = "Chain", y = "proportion",
+          fill = "Lipid type",         
+          color = "black",  
+          sort.by.groups = FALSE,   
+          palette = c("#80FF00FF", "#00FFFFFF", "#8000FFFF", "#FF0000FF"),
+          x.text.angle = 90,          # Rotate vertically x axis texts
+          ylab = "Chain Proportion",
+          xlab = FALSE, 
+          #width = 0.5, 
+          position = position_dodge(0.9),
+          ggtheme = theme_classic()
+          ) 
+facet(bp1, facet.by = "Lipid type", ncol = 1) + rremove("legend")
+
+plot_grid(pie, facet(bp1, facet.by = "Lipid type", ncol = 1) +  rremove("legend"), labels = c('A', 'B'), ncol = 1)
+```
