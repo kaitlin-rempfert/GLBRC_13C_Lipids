@@ -65,11 +65,20 @@ all_meta <- all %>% mutate(
 ```
 
 ```{r}
-p <- all_meta %>% filter(timepoint == "2month") %>% filter(sig == "significant") %>% ggboxplot(x = "lipid_class", y = "mean_rel_enrichment",
-      color = "lipid_class", palette = "Paired") + rremove("legend") + labs(x = "Lipid Class", y = expression("Excess Atom Fraction "*{}^13*"C"))
+p <- all_meta %>% filter(timepoint == "2month") %>% droplevels() %>% ggboxplot(x = "lipid_class", y = "mean_rel_enrichment",
+      color = "lipid_class", palette = "Paired") +
+  stat_compare_means(method = "anova", label.y = .15)+      # Add global p-value
+  stat_compare_means(label = "p.signif", method = "t.test",
+                     ref.group = ".all.") + rremove("legend") + labs(x = "Lipid Class", y = expression("Excess Atom Fraction "*{}^13*"C")) 
 p
 
 bp <- readRDS("output/bp.rds")
 
-plot_grid(bp, p, labels = c("A", "B"), ncol = 1)
+cowplot::plot_grid(bp, p, labels = c("A", "B"), ncol = 1)
 ```
+
+```{r}
+all_meta_filt <- all_meta %>% filter(timepoint == "2month") %>% droplevels()
+headgroup.excess.13C.stat.test <- all_meta_filt %>% t_test(mean_rel_enrichment ~ lipid_class, ref.group = "all")
+```
+

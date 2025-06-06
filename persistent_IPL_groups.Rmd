@@ -136,24 +136,29 @@ e_data_long_intensity <- readRDS("output/e_data_long_meta_filt.RDS") %>% select(
 
 ```{r}
 #merge with metadata
-e_data_long_Rodin <- left_join(e_data_long_intensity, lipidomics_Rodin_meta) %>% na.omit()
+e_data_long_Rodin <- left_join(e_data_long_intensity, lipidomics_Rodin_meta) %>% na.omit() %>% mutate(NOSC = 4 - ((4*C + H - 3*N - 2*O + 5*P)/C))
 
 #calculate mean log2 intensity  of lipid groups
 e_data_long_Rodin_g <- e_data_long_Rodin %>% group_by(subclass, id, TimePoint) %>%
   filter(`Main class` != "CoQ") %>% mutate(
-  log2_intensity_subclass = mean(log2_intensity, na.rm = TRUE)
-) %>% ungroup() %>%
+  log2_intensity_subclass = mean(log2_intensity, na.rm = TRUE),
+                                 NOSC_subclass = mean(NOSC, na.rm = TRUE)) %>% 
+  ungroup() %>%
   group_by(`Sub class`, id, TimePoint) %>%
-  mutate(log2_intensity_sub_class= mean(log2_intensity, na.rm = TRUE)) %>%
+  mutate(log2_intensity_sub_class= mean(log2_intensity, na.rm = TRUE),
+         NOSC_sub_class = mean(NOSC, na.rm = TRUE)) %>%
   ungroup() %>% 
   group_by(`Main class`, id, TimePoint) %>% 
-  mutate(log2_intensity_headgroup = mean(log2_intensity, na.rm = TRUE)) %>% 
+  mutate(log2_intensity_headgroup = mean(log2_intensity, na.rm = TRUE),
+         NOSC_headgroup = mean(NOSC, na.rm = TRUE)) %>% 
   ungroup() %>%
   group_by(Category, id, TimePoint) %>% 
-  mutate(log2_intensity_category = mean(log2_intensity, na.rm = TRUE)) %>%
+  mutate(log2_intensity_category = mean(log2_intensity, na.rm = TRUE),
+         NOSC_category = mean(NOSC, na.rm = TRUE)) %>%
   ungroup() 
 
 #reformat to long df for t-tests
+#log2_intensity
 e_data_longer_Rodin_g <- e_data_long_Rodin_g %>% 
   pivot_longer(cols = c(contains("log2_intensity_")), names_to = "group", names_prefix = "log2_intensity_", values_to = "log2_intensity_group") %>% 
   #add "Lipid Group" column to print the group name for group log2_intensity values
@@ -165,15 +170,29 @@ e_data_longer_Rodin_g <- e_data_long_Rodin_g %>%
       group == "category" ~ Category
     )
   )
+#NOSC
+e_data_longer2_Rodin_g <- e_data_long_Rodin_g %>% 
+  pivot_longer(cols = c(contains("NOSC_")), names_to = "group", names_prefix = "NOSC_", values_to = "NOSC_group") %>% 
+  #add "Lipid Group" column to print the group name for group log2_intensity values
+  mutate(
+    `Lipid Group` = case_when(
+      group == "subclass" ~ subclass, 
+      group == "sub_class" ~ `Sub class`,
+      group == "headgroup" ~ `Main class`,
+      group == "category" ~ Category
+    )
+  )
 
-e_data_long_meta <- e_data_longer_Rodin_g %>% select(c(`Lipid Group`, Site, TimePoint, id, group, log2_intensity_group)) %>% dplyr::rename("Compound" = "Lipid Group", "log2_intensity" = "log2_intensity_group") %>% distinct()
+e_data_longerer_Rodin_g <- left_join(e_data_longer_Rodin_g, e_data_longer2_Rodin_g) 
+
+e_data_long_meta <- e_data_longerer_Rodin_g %>% select(c(`Lipid Group`, Site, TimePoint, id, group, log2_intensity_group, NOSC_group)) %>% dplyr::rename("Compound" = "Lipid Group", "log2_intensity" = "log2_intensity_group", "NOSC" = "NOSC_group") %>% distinct()
 ```
 
 
 ```{r}
 #perform t-test (keep sites separate in case a lipid is persistent in one site and not another)
 compound_intensity_ttest_sep <- e_data_long_meta  %>%
-  select(c(Compound, Site, TimePoint, id, log2_intensity)) %>%
+  select(c(Compound, Site, TimePoint, id, log2_intensity, NOSC)) %>%
   arrange(Compound, Site, TimePoint, id) %>%
   group_by(Compound, Site) %>%
   t_test(log2_intensity ~ TimePoint, paired = TRUE, var.equal = FALSE) %>%
@@ -181,7 +200,7 @@ compound_intensity_ttest_sep <- e_data_long_meta  %>%
   symbols = c("****", "***", "**", "*", "ns"))
 #perform t-test again without separating sites 
 compound_intensity_ttest <- e_data_long_meta  %>%
-  select(c(Compound, Site, TimePoint, id, log2_intensity)) %>%
+  select(c(Compound, Site, TimePoint, id, log2_intensity, NOSC)) %>%
   arrange(Compound, Site, TimePoint, id) %>%
   group_by(Compound) %>%
   t_test(log2_intensity ~ TimePoint, paired = TRUE, var.equal = FALSE) %>%
@@ -335,7 +354,8 @@ all_classified_summarized <- all_classified %>%
    group_by(Compound) %>%
   mutate(
     atomperc_avg = mean(atomperc, na.rm = TRUE), 
-    log2_intensity_avg = mean(log2_intensity, na.rm = TRUE)
+    log2_intensity_avg = mean(log2_intensity, na.rm = TRUE),
+    NOSC_avg = mean(NOSC, na.rm = TRUE)
   ) %>%
   ungroup() %>%
   #need to pivot data to calculate ratio of intensities between timepoints 
@@ -352,14 +372,15 @@ all_classified_summarized <- all_classified %>%
   fill(intensity_timepoint_avg_2month, .direction = "up") %>%
   fill(atomperc_timepoint_avg_2month, .direction = "up") %>%
   mutate(log2FC_intensity = intensity_timepoint_avg_2month - intensity_timepoint_avg_1year) %>%
-  select(c(Compound, group, atomperc_avg, log2_intensity_avg, log2FC_intensity, atomperc_timepoint_avg_1year, p_enrich, effsize_enrich, p_intensity, effsize_intensity, classification, site_classification)) %>% distinct()
+  select(c(Compound, group, NOSC_avg, atomperc_avg, log2_intensity_avg, log2FC_intensity, atomperc_timepoint_avg_1year, p_enrich, effsize_enrich, p_intensity, effsize_intensity, classification, site_classification)) %>% distinct()
 
 #separated by site
 all_classified_sep_summarized <- all_classified_sep %>% 
    group_by(group, Compound, Site) %>%
   mutate(
     atomperc_avg = mean(atomperc, na.rm = TRUE), 
-    log2_intensity_avg = mean(log2_intensity, na.rm = TRUE)
+    log2_intensity_avg = mean(log2_intensity, na.rm = TRUE),
+    NOSC_avg = mean(NOSC, na.rm =TRUE)
   ) %>%
   ungroup() %>%
   #need to pivot data to calculate ratio of intensities between timepoints 
@@ -376,7 +397,7 @@ all_classified_sep_summarized <- all_classified_sep %>%
   fill(intensity_timepoint_avg_2month, .direction = "up") %>%
   fill(atomperc_timepoint_avg_2month, .direction = "up") %>%
   mutate(log2FC_intensity = intensity_timepoint_avg_2month - intensity_timepoint_avg_1year) %>%
-  select(c(Compound, group, Site, atomperc_avg, log2_intensity_avg, log2FC_intensity, atomperc_timepoint_avg_1year, p_enrich, effsize_enrich, p_intensity, effsize_intensity, classification, site_classification)) %>% distinct()
+  select(c(Compound, group, Site, NOSC_avg, atomperc_avg, log2_intensity_avg, log2FC_intensity, atomperc_timepoint_avg_1year, p_enrich, effsize_enrich, p_intensity, effsize_intensity, classification, site_classification)) %>% distinct()
 ```
 
 # Create Heatmap Tables 
@@ -385,15 +406,23 @@ all_classified_sep_summarized <- all_classified_sep %>%
 ## Prepare dataframe for Complexheatmap
 ```{r}
 #reorder data (MI switchgrass 2 month, MI switchgrass 1 year...then WI with same pattern)
-lipids_wmeta_ordered <- all_classified_summarized %>% select(c(Compound, group, classification, atomperc_avg, atomperc_timepoint_avg_1year, p_enrich, effsize_enrich, log2_intensity_avg, p_intensity, effsize_intensity, log2FC_intensity, site_classification)) %>% 
+lipids_wmeta_ordered <- all_classified_summarized %>% select(c(Compound, group, classification, NOSC_avg, atomperc_avg, atomperc_timepoint_avg_1year, p_enrich, effsize_enrich, log2_intensity_avg, p_intensity, effsize_intensity, log2FC_intensity, site_classification)) %>% 
 #remove any rows with NA values 
   na.omit() %>%
-  mutate(classification = factor(classification, levels = c("persistent", "continued production", "degraded",  "unclassified"))) %>%
+  mutate(classification = factor(classification, levels = c("persistent", "continued production", "degraded",  "unclassified")),
+         #add charge at neutral pH
+         z = case_when(
+           grepl("PI", Compound) ~ -1,
+           grepl("hydroxy", Compound) ~ -1,
+           grepl("PG", Compound) ~ -1,
+           TRUE ~ 0
+         )
+         ) %>%
   group_by(classification, group) %>% arrange(classification, effsize_enrich) 
 #%>% mutate(atomperc_avg = atomperc_avg * 100, atomperc_avg_1year = atomperc_timepoint_avg_1year * 100)
 #sep
 #reorder data (MI switchgrass 2 month, MI switchgrass 1 year...then WI with same pattern)
-lipids_wmeta_ordered_sep <- all_classified_sep_summarized %>% select(c(Compound, group, classification, Site, atomperc_avg, atomperc_timepoint_avg_1year, p_enrich, effsize_enrich, log2_intensity_avg, p_intensity, effsize_intensity, log2FC_intensity, site_classification)) %>% 
+lipids_wmeta_ordered_sep <- all_classified_sep_summarized %>% select(c(Compound, group, classification, NOSC_avg, Site, atomperc_avg, atomperc_timepoint_avg_1year, p_enrich, effsize_enrich, log2_intensity_avg, p_intensity, effsize_intensity, log2FC_intensity, site_classification)) %>% 
   dplyr::rename("site_desig" = "Site") %>%
 #remove any rows with NA values 
   na.omit() %>%
@@ -419,10 +448,14 @@ col_atm_fun = circlize::colorRamp2(c(0, 0.015), c("white", "#FF7F00"))
 col_C_fun = circlize::colorRamp2(c(15, 20), c("white", "#E31A1C"))
 
 col_DBE_fun = circlize::colorRamp2(c(0, 4), c("white", "#1F78B4"))
+
+col_NOSC_fun = circlize::colorRamp2(c(-1.9, -1.3), c("#E31A1C", "white"))
+
+col_z_fun = circlize::colorRamp2(c(-1, 1), c("#1F78B4", "white"))
 ```
 
 
-### All subclassifications, no site specific stats
+### All subclassifications, no site specific stats 
 ```{r}
 #create df of just subclasses 
 lipidsub_wmeta_ordered <- lipids_wmeta_ordered %>% filter(group == "subclass") %>% 
@@ -464,6 +497,18 @@ ha1 = rowAnnotation("d" = anno_numeric(effsize_enrich,
 #intensity barplot
 ratio = as.vector(lipidsub_wmeta_ordered$log2FC_intensity)
 ha3 = rowAnnotation("Log2FC intensity" = anno_barplot(ratio, baseline = 0, gp = gpar(fill = "#1F78B4", col = "#1F78B4"), width = unit(3, "cm")))
+
+#NOSC
+haN = rowAnnotation(
+  "NOSC" = lipidsub_wmeta_ordered$NOSC_avg,
+  col = list(NOSC = col_NOSC_fun)
+)
+
+#z
+haz = rowAnnotation(
+  "Z" = lipidsub_wmeta_ordered$z,
+  col = list(Z = col_z_fun))
+
 
 #p value intensity
 #p value enrichment
@@ -523,12 +568,12 @@ ha_empty = rowAnnotation(foo = anno_empty(border = FALSE,
             #classification = list(direction = "horizontal", title_position = "lefttop", nrow = 1)))
 
 
-draw(ha_empty + ha_class + ha_lipid + h_atmperc2 + ha1 + ha2 + ha3 + ha4 + ha5, annotation_legend_list = list(lgd_lipid, lgd_pvalue, lgd_sig), heatmap_legend_side = "right", annotation_legend_side = "right", merge_legends = TRUE)
+draw(ha_empty + ha_class + ha_lipid + haz + haN + h_atmperc2 + ha1 + ha2 + ha3 + ha4 + ha5, annotation_legend_list = list(lgd_lipid, lgd_pvalue, lgd_sig), heatmap_legend_side = "right", annotation_legend_side = "right", merge_legends = TRUE)
 
 
 for(i in 1:4) {
     decorate_annotation("foo", slice = i, {
-        grid.text(paste(text_list[[i]], collapse = "\n"), x = unit(5, "mm"), rot = 0, just = "right")
+        grid.text(paste(text_list[[i]], collapse = "\n"), x = unit(6.5, "mm"), rot = 0, just = "right")
     })
 }
 ```

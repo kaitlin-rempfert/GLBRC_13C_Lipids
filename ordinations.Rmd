@@ -127,7 +127,7 @@ ps_lipids_fc <- phyloseq(OTU_fc, TAX, samples)
 
 ### PCA with loadings - intensity
 ```{r}
-paired_2 <- c("#1F78B4", "#E31A1C")
+paired_2 <- c("#A6CEE3", "#E31A1C")
 
 ps_lipids_int %>% 
   tax_transform("compositional", rank = "Lipid_class") %>% 
@@ -311,7 +311,7 @@ ps_lipids_fc <- phyloseq(OTU_fc, TAX, samples)
 
 ### PCA with loadings - intensity
 ```{r}
-paired_2 <- c("#1F78B4", "#E31A1C")
+paired_2 <- c("#A6CEE3", "#E31A1C")
 
 ps_lipids_int %>% 
   tax_transform("compositional", rank = "Lipid_class") %>% 
